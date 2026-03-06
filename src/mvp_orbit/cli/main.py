@@ -4,6 +4,8 @@ import argparse
 import json
 import os
 import shutil
+import sys
+import time
 from pathlib import Path
 
 import httpx
@@ -11,7 +13,7 @@ import httpx
 from mvp_orbit.cli.package import build_file_package
 from mvp_orbit.config import OrbitConfig, ensure_hub_secrets, load_config, save_config
 from mvp_orbit.core.canonical import object_id_for_json
-from mvp_orbit.core.models import CommandObject, RunCreateRequest, SignedTaskObject, TaskObject, utc_now
+from mvp_orbit.core.models import CommandObject, RunCreateRequest, RunStatus, SignedTaskObject, TaskObject, utc_now
 from mvp_orbit.core.signing import generate_keypair_b64, sign_payload
 from mvp_orbit.integrations.object_store import GitHubGhCliBackend, ObjectStore
 
@@ -83,6 +85,10 @@ def _build_object_store(args: argparse.Namespace) -> ObjectStore:
 
 def _load_json(path: str) -> dict:
     return json.loads(Path(path).read_text(encoding="utf-8"))
+
+
+def _is_terminal_status(value: str) -> bool:
+    return value in {RunStatus.SUCCEEDED.value, RunStatus.FAILED.value, RunStatus.REJECTED.value, RunStatus.CANCELED.value}
 
 
 def _prompt(text: str, default: str | None = None, *, required: bool = False) -> str:
@@ -244,13 +250,35 @@ def cmd_run_cancel(args: argparse.Namespace) -> int:
 
 
 def cmd_run_logs(args: argparse.Namespace) -> int:
+    store = _build_object_store(args)
+    if args.follow:
+        seen: set[str] = set()
+        with httpx.Client(timeout=20) as client:
+            while True:
+                response = client.get(f"{args.hub_url}/api/runs/{args.run_id}", headers=_headers(args.api_token))
+                response.raise_for_status()
+                run_record = response.json()
+                new_logs = []
+                for log_id in run_record.get("log_ids", []):
+                    if log_id in seen:
+                        continue
+                    seen.add(log_id)
+                    new_logs.append(store.get_log(log_id))
+                for log in sorted(new_logs, key=lambda item: item.seq):
+                    target = sys.stderr if log.stream == "stderr" else sys.stdout
+                    print(log.data, end="", file=target, flush=True)
+                if _is_terminal_status(run_record["status"]):
+                    break
+                time.sleep(args.poll_interval_sec)
+        return 0
+
     with httpx.Client(timeout=20) as client:
         response = client.get(f"{args.hub_url}/api/runs/{args.run_id}", headers=_headers(args.api_token))
         response.raise_for_status()
         run_record = response.json()
 
-    store = _build_object_store(args)
     logs = [store.get_log(log_id).model_dump(mode="json") for log_id in run_record.get("log_ids", [])]
+    logs.sort(key=lambda item: item["seq"])
     print(json.dumps({"run_id": args.run_id, "logs": logs}, ensure_ascii=False, indent=2))
     return 0
 
@@ -370,6 +398,8 @@ def build_parser() -> argparse.ArgumentParser:
     run_logs.add_argument("--hub-url", default=None)
     run_logs.add_argument("--run-id", required=True)
     run_logs.add_argument("--api-token", default=os.getenv("ORBIT_API_TOKEN"))
+    run_logs.add_argument("--follow", action="store_true")
+    run_logs.add_argument("--poll-interval-sec", type=float, default=2.0)
     _add_github_store_args(run_logs)
     run_logs.set_defaults(func=cmd_run_logs)
 

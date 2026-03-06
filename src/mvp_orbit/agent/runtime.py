@@ -4,7 +4,7 @@ import io
 import shutil
 import subprocess
 import tarfile
-import tempfile
+import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -31,6 +31,75 @@ class CanceledRunError(Exception):
     pass
 
 
+class LiveLogStreamer:
+    def __init__(
+        self,
+        *,
+        run_id: str,
+        object_store: ObjectStore,
+        publish_logs: Callable[[list[str]], None] | None,
+        flush_interval_sec: float = 10.0,
+        flush_bytes: int = 16 * 1024,
+    ) -> None:
+        self.run_id = run_id
+        self.object_store = object_store
+        self.publish_logs = publish_logs
+        self.flush_interval_sec = flush_interval_sec
+        self.flush_bytes = flush_bytes
+        self._lock = threading.Lock()
+        self._buffers = {"stdout": [], "stderr": []}
+        self._sizes = {"stdout": 0, "stderr": 0}
+        self._last_flush = time.monotonic()
+        self._next_seq = 1
+        self.log_ids: list[str] = []
+
+    def append(self, stream: str, data: str) -> None:
+        if not data:
+            return
+        with self._lock:
+            self._buffers[stream].append(data)
+            self._sizes[stream] += len(data.encode("utf-8"))
+
+    def flush_ready(self, *, force: bool = False) -> None:
+        now = time.monotonic()
+        ready: list[tuple[int, LogObject]] = []
+        with self._lock:
+            for stream in ("stdout", "stderr"):
+                has_data = bool(self._buffers[stream])
+                due_by_size = self._sizes[stream] >= self.flush_bytes
+                due_by_time = has_data and (now - self._last_flush >= self.flush_interval_sec)
+                if not has_data or not (force or due_by_size or due_by_time):
+                    continue
+                payload = "".join(self._buffers[stream])
+                self._buffers[stream].clear()
+                self._sizes[stream] = 0
+                seq = self._next_seq
+                self._next_seq += 1
+                ready.append(
+                    (
+                        seq,
+                        LogObject(
+                            run_id=self.run_id,
+                            seq=seq,
+                            stream=stream,
+                            data=payload,
+                            captured_at=datetime.now(timezone.utc),
+                        ),
+                    )
+                )
+            if ready:
+                self._last_flush = now
+        if not ready:
+            return
+        ready.sort(key=lambda item: item[0])
+        new_log_ids: list[str] = []
+        for _, log in ready:
+            new_log_ids.append(self.object_store.put_log(log))
+        self.log_ids.extend(new_log_ids)
+        if self.publish_logs is not None:
+            self.publish_logs(new_log_ids)
+
+
 class AgentRuntime:
     def __init__(
         self,
@@ -52,18 +121,24 @@ class AgentRuntime:
         self.workspace_root.mkdir(parents=True, exist_ok=True)
         self.heartbeat_interval_sec = heartbeat_interval_sec
 
-    def handle_run(self, lease: RunLease, *, heartbeat: Callable[[str], None] | None = None) -> ExecutionOutcome:
+    def handle_run(
+        self,
+        lease: RunLease,
+        *,
+        heartbeat: Callable[[str], bool] | None = None,
+        publish_logs: Callable[[list[str]], None] | None = None,
+    ) -> ExecutionOutcome:
         try:
             package_id, command = self._validate_and_load_objects(lease)
             if heartbeat is not None:
                 if heartbeat("preparing"):
                     raise CanceledRunError("run canceled before execution")
             workspace = self._prepare_workspace(lease.run_id, package_id)
-            return self._execute_command(lease, command, workspace, heartbeat)
+            return self._execute_command(lease, command, workspace, heartbeat, publish_logs)
         except CanceledRunError as exc:
             now = datetime.now(timezone.utc)
             stderr_log_id = self.object_store.put_log(
-                LogObject(stream="stderr", data=str(exc), captured_at=now)
+                LogObject(run_id=lease.run_id, seq=1, stream="stderr", data=str(exc), captured_at=now)
             )
             result_id = self.object_store.put_result(
                 ResultObject(
@@ -73,6 +148,8 @@ class AgentRuntime:
                     finished_at=now,
                 )
             )
+            if publish_logs is not None:
+                publish_logs([stderr_log_id])
             return ExecutionOutcome(
                 status=RunStatus.CANCELED,
                 log_ids=[stderr_log_id],
@@ -83,7 +160,7 @@ class AgentRuntime:
         except Exception as exc:
             now = datetime.now(timezone.utc)
             stderr_log_id = self.object_store.put_log(
-                LogObject(stream="stderr", data=str(exc), captured_at=now)
+                LogObject(run_id=lease.run_id, seq=1, stream="stderr", data=str(exc), captured_at=now)
             )
             result_id = self.object_store.put_result(
                 ResultObject(
@@ -93,6 +170,8 @@ class AgentRuntime:
                     finished_at=now,
                 )
             )
+            if publish_logs is not None:
+                publish_logs([stderr_log_id])
             return ExecutionOutcome(
                 status=RunStatus.REJECTED,
                 log_ids=[stderr_log_id],
@@ -156,95 +235,89 @@ class AgentRuntime:
         command,
         workspace: Path,
         heartbeat: Callable[[str], bool] | None,
+        publish_logs: Callable[[list[str]], None] | None,
     ) -> ExecutionOutcome:
         started_at = datetime.now(timezone.utc)
-        stdout_path = Path(tempfile.mkstemp(prefix="orbit-stdout-", dir=workspace)[1])
-        stderr_path = Path(tempfile.mkstemp(prefix="orbit-stderr-", dir=workspace)[1])
+        cwd = (workspace / command.working_dir).resolve()
+        workspace_root = workspace.resolve()
+        if cwd != workspace_root and workspace_root not in cwd.parents:
+            raise RuntimeError("command working_dir escapes workspace")
 
-        try:
-            cwd = (workspace / command.working_dir).resolve()
-            workspace_root = workspace.resolve()
-            if cwd != workspace_root and workspace_root not in cwd.parents:
-                raise RuntimeError("command working_dir escapes workspace")
+        env = self._merged_env(command.env_patch)
+        proc = subprocess.Popen(
+            command.argv,
+            cwd=str(cwd),
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+        )
+        assert proc.stdout is not None
+        assert proc.stderr is not None
 
-            env = self._merged_env(command.env_patch)
-            with stdout_path.open("w", encoding="utf-8") as stdout_handle, stderr_path.open("w", encoding="utf-8") as stderr_handle:
-                proc = subprocess.Popen(
-                    command.argv,
-                    cwd=str(cwd),
-                    env=env,
-                    stdout=stdout_handle,
-                    stderr=stderr_handle,
-                    text=True,
-                )
+        streamer = LiveLogStreamer(
+            run_id=lease.run_id,
+            object_store=self.object_store,
+            publish_logs=publish_logs,
+        )
+        stdout_thread = threading.Thread(target=self._read_stream, args=(proc.stdout, "stdout", streamer), daemon=True)
+        stderr_thread = threading.Thread(target=self._read_stream, args=(proc.stderr, "stderr", streamer), daemon=True)
+        stdout_thread.start()
+        stderr_thread.start()
 
-                next_heartbeat = time.monotonic()
-                deadline = time.monotonic() + command.timeout_sec
-                timed_out = False
-                canceled = False
-                while True:
-                    if heartbeat is not None and time.monotonic() >= next_heartbeat:
-                        if heartbeat("running"):
-                            return_code = self._terminate_process(proc)
-                            timed_out = False
-                            canceled = True
-                            break
-                        next_heartbeat = time.monotonic() + self.heartbeat_interval_sec
+        next_heartbeat = time.monotonic()
+        deadline = time.monotonic() + command.timeout_sec
+        timed_out = False
+        canceled = False
+        while True:
+            streamer.flush_ready()
+            if heartbeat is not None and time.monotonic() >= next_heartbeat:
+                if heartbeat("running"):
+                    return_code = self._terminate_process(proc)
+                    timed_out = False
+                    canceled = True
+                    break
+                next_heartbeat = time.monotonic() + self.heartbeat_interval_sec
 
-                    return_code = proc.poll()
-                    if return_code is not None:
-                        canceled = False
-                        break
-                    if time.monotonic() >= deadline:
-                        timed_out = True
-                        canceled = False
-                        proc.kill()
-                        proc.wait()
-                        return_code = -1
-                        break
-                    time.sleep(0.2)
+            return_code = proc.poll()
+            if return_code is not None:
+                break
+            if time.monotonic() >= deadline:
+                timed_out = True
+                proc.kill()
+                proc.wait()
+                return_code = -1
+                break
+            time.sleep(0.2)
 
-            finished_at = datetime.now(timezone.utc)
-            stdout = stdout_path.read_text(encoding="utf-8")
-            stderr = stderr_path.read_text(encoding="utf-8")
+        stdout_thread.join(timeout=2)
+        stderr_thread.join(timeout=2)
+        streamer.flush_ready(force=True)
 
-            log_ids: list[str] = []
-            if stdout:
-                log_ids.append(
-                    self.object_store.put_log(
-                        LogObject(stream="stdout", data=stdout, captured_at=finished_at)
-                    )
-                )
-            if stderr:
-                log_ids.append(
-                    self.object_store.put_log(
-                        LogObject(stream="stderr", data=stderr, captured_at=finished_at)
-                    )
-                )
-
-            status = RunStatus.SUCCEEDED if return_code == 0 and not timed_out and not canceled else RunStatus.FAILED
-            failure_code = "timeout" if timed_out else None
-            if canceled:
-                status = RunStatus.CANCELED
-                failure_code = "canceled"
-            result_id = self.object_store.put_result(
-                ResultObject(
-                    status=status.value,
-                    exit_code=return_code,
-                    started_at=started_at,
-                    finished_at=finished_at,
-                )
+        finished_at = datetime.now(timezone.utc)
+        status = RunStatus.SUCCEEDED if return_code == 0 and not timed_out and not canceled else RunStatus.FAILED
+        failure_code = "timeout" if timed_out else None
+        if canceled:
+            status = RunStatus.CANCELED
+            failure_code = "canceled"
+        result_id = self.object_store.put_result(
+            ResultObject(
+                status=status.value,
+                exit_code=return_code,
+                started_at=started_at,
+                finished_at=finished_at,
             )
-            return ExecutionOutcome(
-                status=status,
-                log_ids=log_ids,
-                result_id=result_id,
-                artifact_ids=[],
-                failure_code=failure_code,
-            )
-        finally:
-            stdout_path.unlink(missing_ok=True)
-            stderr_path.unlink(missing_ok=True)
+        )
+        return ExecutionOutcome(
+            status=status,
+            log_ids=streamer.log_ids,
+            result_id=result_id,
+            artifact_ids=[],
+            failure_code=failure_code,
+        )
 
     @staticmethod
     def _terminate_process(proc: subprocess.Popen[str], grace_sec: float = 10.0) -> int:
@@ -278,3 +351,14 @@ class AgentRuntime:
         env = os.environ.copy()
         env.update(extra_env)
         return env
+
+    @staticmethod
+    def _read_stream(pipe, stream: str, streamer: LiveLogStreamer) -> None:
+        try:
+            while True:
+                chunk = pipe.read(4096)
+                if not chunk:
+                    break
+                streamer.append(stream, chunk)
+        finally:
+            pipe.close()

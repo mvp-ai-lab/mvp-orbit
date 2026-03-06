@@ -6,7 +6,7 @@ from dataclasses import dataclass
 import httpx
 
 from mvp_orbit.agent.runtime import AgentRuntime
-from mvp_orbit.core.models import RunCompletionRequest, RunHeartbeatRequest, RunHeartbeatResponse, RunLease
+from mvp_orbit.core.models import RunCompletionRequest, RunHeartbeatRequest, RunHeartbeatResponse, RunLease, RunLogAppendRequest
 
 
 @dataclass
@@ -37,7 +37,11 @@ class AgentService:
             response.raise_for_status()
 
             lease = RunLease.model_validate(response.json())
-            outcome = self.runtime.handle_run(lease, heartbeat=lambda phase: self._heartbeat(client, lease.run_id, phase))
+            outcome = self.runtime.handle_run(
+                lease,
+                heartbeat=lambda phase: self._heartbeat(client, lease.run_id, phase),
+                publish_logs=lambda log_ids: self._publish_logs(client, lease.run_id, log_ids),
+            )
             self._complete(client, lease.run_id, outcome)
             return outcome.status.value
         except (httpx.RequestError, httpx.HTTPStatusError):
@@ -73,6 +77,17 @@ class AgentService:
         )
         response = client.post(
             f"{self.hub_url}/api/runs/{run_id}/complete",
+            headers=self._headers(),
+            json=request.model_dump(mode="json"),
+        )
+        response.raise_for_status()
+
+    def _publish_logs(self, client: httpx.Client, run_id: str, log_ids: list[str]) -> None:
+        if not log_ids:
+            return
+        request = RunLogAppendRequest(log_ids=log_ids)
+        response = client.post(
+            f"{self.hub_url}/api/runs/{run_id}/logs",
             headers=self._headers(),
             json=request.model_dump(mode="json"),
         )

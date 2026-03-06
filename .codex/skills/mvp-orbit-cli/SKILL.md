@@ -43,10 +43,12 @@ Always parse the JSON output of each CLI command and feed the returned IDs into 
 
 - Use `orbit run status --run-id <run_id>` for current state.
 - Use `orbit run logs --run-id <run_id>` to fetch collected stdout/stderr.
+- Use `orbit run logs --run-id <run_id> --follow` when the user wants live log output while a task is running.
 - Use `orbit run result --run-id <run_id>` to fetch the final result object.
 - Use `orbit run cancel --run-id <run_id>` to stop a queued or running task.
 - Treat `queued` and `running` as non-terminal.
 - Treat `succeeded`, `failed`, `rejected`, and `canceled` as terminal.
+- Assume the Agent uploads log chunks every 10 seconds by default, or earlier when buffered output exceeds 16 KiB.
 
 ## Working rules
 

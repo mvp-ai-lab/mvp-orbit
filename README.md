@@ -260,9 +260,16 @@ orbit run status --run-id <RUN_ID>
 orbit run logs \
   --run-id <RUN_ID>
 
+orbit run logs \
+  --run-id <RUN_ID> \
+  --follow
+
 orbit run result \
   --run-id <RUN_ID>
 
 orbit run cancel \
   --run-id <RUN_ID>
 ```
+
+`orbit run logs --follow` prints streamed stdout/stderr as log chunks arrive.
+The Agent uploads log chunks every 10 seconds by default, or earlier when buffered output exceeds 16 KiB.

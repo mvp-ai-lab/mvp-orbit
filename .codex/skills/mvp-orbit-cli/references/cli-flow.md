@@ -118,7 +118,14 @@ orbit run status --run-id <RUN_ID>
 
 ```bash
 orbit run logs --run-id <RUN_ID>
+
+orbit run logs --run-id <RUN_ID> --follow
 ```
+
+Notes:
+
+- `--follow` prints incremental stdout/stderr as chunks arrive.
+- The Agent uploads a chunk every 10 seconds by default, or earlier when buffered output exceeds 16 KiB.
 
 ### Result
 

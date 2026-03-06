@@ -149,6 +149,29 @@ class RunStore:
             assert row is not None
             return self._row_to_record(dict(row))
 
+    def append_log_ids(self, run_id: str, log_ids: list[str]) -> RunRecord:
+        if not log_ids:
+            record = self.get_run(run_id)
+            if record is None:
+                raise KeyError(run_id)
+            return record
+        with self._lock, self._conn:
+            row = self._conn.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone()
+            if row is None:
+                raise KeyError(run_id)
+            current = json.loads(row["log_ids"] or "[]")
+            merged = current[:]
+            for log_id in log_ids:
+                if log_id not in merged:
+                    merged.append(log_id)
+            self._conn.execute(
+                "UPDATE runs SET log_ids = ? WHERE run_id = ?",
+                (json.dumps(merged), run_id),
+            )
+            updated = self._conn.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone()
+            assert updated is not None
+            return self._row_to_record(dict(updated))
+
     def get_run(self, run_id: str) -> RunRecord | None:
         with self._lock:
             row = self._conn.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone()

@@ -54,6 +54,8 @@ class SignedTaskObject(BaseModel):
 class LogObject(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    run_id: str
+    seq: int = Field(ge=1)
     stream: str = Field(pattern="^(stdout|stderr)$")
     data: str
     captured_at: datetime
@@ -144,6 +146,12 @@ class RunCompletionRequest(BaseModel):
         if value not in {RunStatus.SUCCEEDED, RunStatus.FAILED, RunStatus.REJECTED, RunStatus.CANCELED}:
             raise ValueError("completion status must be a final state")
         return value
+
+
+class RunLogAppendRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    log_ids: list[str] = Field(default_factory=list)
 
 
 class RunRecord(BaseModel):

@@ -12,6 +12,7 @@ from mvp_orbit.core.models import (
     RunCreateResponse,
     RunHeartbeatRequest,
     RunHeartbeatResponse,
+    RunLogAppendRequest,
     RunRecord,
     RunStatus,
     default_run_id,
@@ -116,6 +117,14 @@ def create_app(
     def complete(run_id: str, completion: RunCompletionRequest) -> dict[str, str]:
         try:
             run_store.complete(run_id, completion)
+        except KeyError as exc:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="run not found") from exc
+        return {"status": "accepted"}
+
+    @app.post("/api/runs/{run_id}/logs", dependencies=[Depends(require_auth)])
+    def append_logs(run_id: str, request: RunLogAppendRequest) -> dict[str, str]:
+        try:
+            run_store.append_log_ids(run_id, request.log_ids)
         except KeyError as exc:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="run not found") from exc
         return {"status": "accepted"}

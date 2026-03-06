@@ -348,3 +348,60 @@ def test_running_run_can_be_canceled(tmp_path):
     record = client.get(f"/api/runs/{run_id}", headers={"Authorization": "Bearer api-token"}).json()
     assert record["status"] == "canceled"
     assert record["failure_code"] == "canceled"
+
+
+def test_large_stdout_is_published_in_chunks(tmp_path):
+    store = _build_store()
+    private_key, public_key = generate_keypair_b64()
+
+    source_dir = tmp_path / "src"
+    source_dir.mkdir()
+    (source_dir / "placeholder.txt").write_text("placeholder", encoding="utf-8")
+    package_build = build_file_package(source_dir)
+    package_id = store.put_package(package_build.archive_path.read_bytes())
+    command_id = store.put_command(
+        CommandObject(
+            argv=[
+                sys.executable,
+                "-c",
+                "import sys,time; sys.stdout.write('x'*20000); sys.stdout.flush(); time.sleep(1.0)",
+            ],
+            working_dir=".",
+            timeout_sec=30,
+        )
+    )
+    signed_task = _signed_task(package_id, command_id, private_key)
+    task_id = store.put_signed_task(signed_task)
+
+    ticket_mgr = RunTicketManager("m" * 32)
+    run_ticket, _ = ticket_mgr.issue(
+        run_id="run-stream",
+        agent_id="agent-a",
+        task_id=task_id,
+        expires_at=datetime.now(timezone.utc) + timedelta(seconds=120),
+    )
+    lease = RunLease(
+        run_id="run-stream",
+        agent_id="agent-a",
+        task_id=task_id,
+        run_ticket=run_ticket,
+        expires_at=datetime.now(timezone.utc) + timedelta(seconds=120),
+    )
+
+    runtime = AgentRuntime(
+        agent_id="agent-a",
+        ticket_manager=ticket_mgr,
+        replay_guard=ReplayGuard(),
+        object_store=store,
+        verify_public_key_b64=public_key,
+        workspace_root=tmp_path / "workspaces",
+        heartbeat_interval_sec=0.01,
+    )
+
+    published: list[list[str]] = []
+    outcome = runtime.handle_run(lease, publish_logs=lambda log_ids: published.append(log_ids[:]))
+    assert outcome.status.value == "succeeded"
+    assert published
+    assert outcome.log_ids
+    logs = [store.get_log(log_id) for log_id in outcome.log_ids]
+    assert any(log.stream == "stdout" and "x" * 1000 in log.data for log in logs)

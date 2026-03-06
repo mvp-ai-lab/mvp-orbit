@@ -259,9 +259,16 @@ orbit run status --run-id <RUN_ID>
 orbit run logs \
   --run-id <RUN_ID>
 
+orbit run logs \
+  --run-id <RUN_ID> \
+  --follow
+
 orbit run result \
   --run-id <RUN_ID>
 
 orbit run cancel \
   --run-id <RUN_ID>
 ```
+
+`orbit run logs --follow` 会随着日志分片到达持续打印 stdout/stderr。
+Agent 默认每 10 秒上传一次日志分片；如果缓冲输出超过 16 KiB，也会提前上传。
