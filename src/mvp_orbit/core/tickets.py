@@ -44,16 +44,12 @@ class RunTicketManager:
         run_id: str,
         agent_id: str,
         task_id: str,
-        package_id: str,
-        command_id: str,
         expires_at: datetime,
     ) -> tuple[str, TicketPayload]:
         payload = TicketPayload(
             run_id=run_id,
             agent_id=agent_id,
             task_id=task_id,
-            package_id=package_id,
-            command_id=command_id,
             nonce=secrets.token_hex(16),
             issued_at=datetime.now(timezone.utc),
             expires_at=expires_at,

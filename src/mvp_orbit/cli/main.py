@@ -9,6 +9,7 @@ from pathlib import Path
 import httpx
 
 from mvp_orbit.cli.package import build_file_package
+from mvp_orbit.config import OrbitConfig, ensure_hub_secrets, load_config, save_config
 from mvp_orbit.core.canonical import object_id_for_json
 from mvp_orbit.core.models import CommandObject, RunCreateRequest, SignedTaskObject, TaskObject, utc_now
 from mvp_orbit.core.signing import generate_keypair_b64, sign_payload
@@ -29,6 +30,47 @@ def _headers(api_token: str | None) -> dict[str, str]:
     return headers
 
 
+def _set_if_missing(args: argparse.Namespace, name: str, value) -> None:
+    if not hasattr(args, name) or value is None:
+        return
+    current = getattr(args, name)
+    if current is None or current == "":
+        setattr(args, name, value)
+
+
+def _set_env_if_missing(name: str, value: str | None) -> None:
+    if value and not os.getenv(name):
+        os.environ[name] = value
+
+
+def _apply_config_defaults(args: argparse.Namespace, config: OrbitConfig) -> None:
+    _set_if_missing(args, "github_owner", config.github.owner)
+    _set_if_missing(args, "github_repo", config.github.repo)
+    _set_if_missing(args, "github_release_prefix", config.github.release_prefix)
+    _set_if_missing(args, "gh_bin", config.github.gh_bin)
+    _set_if_missing(args, "hub_url", config.hub.resolved_url())
+    _set_if_missing(args, "api_token", config.auth.api_token)
+    _set_if_missing(args, "private_key", config.task_signing.private_key_b64)
+    _set_if_missing(args, "agent_id", config.agent.id)
+
+    _set_env_if_missing("ORBIT_GITHUB_OWNER", config.github.owner)
+    _set_env_if_missing("ORBIT_GITHUB_REPO", config.github.repo)
+    _set_env_if_missing("ORBIT_GITHUB_RELEASE_PREFIX", config.github.release_prefix)
+    _set_env_if_missing("ORBIT_GH_BIN", config.github.gh_bin)
+    _set_env_if_missing("ORBIT_API_TOKEN", config.auth.api_token)
+    _set_env_if_missing("ORBIT_TICKET_SECRET", config.auth.ticket_secret)
+    _set_env_if_missing("ORBIT_TASK_PRIVATE_KEY_B64", config.task_signing.private_key_b64)
+    _set_env_if_missing("ORBIT_TASK_PUBLIC_KEY_B64", config.task_signing.public_key_b64)
+    _set_env_if_missing("ORBIT_HUB_HOST", config.hub.host)
+    _set_env_if_missing("ORBIT_HUB_PORT", str(config.hub.port))
+    _set_env_if_missing("ORBIT_HUB_DB", config.hub.db)
+    _set_env_if_missing("ORBIT_HUB_URL", config.hub.resolved_url())
+    _set_env_if_missing("ORBIT_AGENT_ID", config.agent.id)
+    _set_env_if_missing("ORBIT_WORKSPACE_ROOT", config.agent.workspace_root)
+    _set_env_if_missing("ORBIT_AGENT_POLL_SEC", str(config.agent.poll_interval_sec))
+    _set_env_if_missing("ORBIT_AGENT_HEARTBEAT_SEC", str(config.agent.heartbeat_interval_sec))
+
+
 def _build_object_store(args: argparse.Namespace) -> ObjectStore:
     backend = GitHubGhCliBackend(
         owner=args.github_owner,
@@ -41,6 +83,78 @@ def _build_object_store(args: argparse.Namespace) -> ObjectStore:
 
 def _load_json(path: str) -> dict:
     return json.loads(Path(path).read_text(encoding="utf-8"))
+
+
+def _prompt(text: str, default: str | None = None, *, required: bool = False) -> str:
+    suffix = f" [{default}]" if default not in (None, "") else ""
+    while True:
+        value = input(f"{text}{suffix}: ").strip()
+        if value:
+            return value
+        if default not in (None, ""):
+            return str(default)
+        if not required:
+            return ""
+
+
+def _validate_required(parser: argparse.ArgumentParser, args: argparse.Namespace, *names: str) -> None:
+    missing = [name for name in names if not getattr(args, name, None)]
+    if missing:
+        parser.error(f"missing required configuration/arguments: {', '.join('--' + name.replace('_', '-') for name in missing)}")
+
+
+def cmd_init_hub(args: argparse.Namespace) -> int:
+    config_path, config = load_config(args.config)
+
+    config.github.owner = _prompt("GitHub owner", config.github.owner, required=True)
+    config.github.repo = _prompt("GitHub relay repo", config.github.repo, required=True)
+    config.github.release_prefix = _prompt("GitHub release prefix", config.github.release_prefix)
+    config.github.gh_bin = _prompt("gh binary", config.github.gh_bin)
+    config.hub.host = _prompt("Hub bind host", config.hub.host)
+    config.hub.port = int(_prompt("Hub bind port", str(config.hub.port)))
+    config.hub.db = _prompt("Hub sqlite path", config.hub.db)
+    config.hub.url = _prompt("Hub public URL", config.hub.resolved_url())
+
+    ensure_hub_secrets(config)
+    saved_path = save_config(config, config_path)
+
+    print(f"Wrote Hub config to {saved_path}")
+    print(f"Hub URL: {config.hub.resolved_url()}")
+    print(f"ORBIT_API_TOKEN={config.auth.api_token}")
+    print(f"ORBIT_TICKET_SECRET={config.auth.ticket_secret}")
+    print(f"ORBIT_TASK_PUBLIC_KEY_B64={config.task_signing.public_key_b64}")
+    print("Task private key has been stored in the config file for local task signing.")
+    return 0
+
+
+def cmd_init_agent(args: argparse.Namespace) -> int:
+    config_path, config = load_config(args.config)
+
+    default_agent_id = args.agent_id or config.agent.id
+    config.agent.id = _prompt("Agent ID", default_agent_id, required=True)
+    config.hub.url = _prompt("Hub URL", config.hub.resolved_url(), required=True)
+    config.github.owner = _prompt("GitHub owner", config.github.owner, required=True)
+    config.github.repo = _prompt("GitHub relay repo", config.github.repo, required=True)
+    config.github.release_prefix = _prompt("GitHub release prefix", config.github.release_prefix)
+    config.github.gh_bin = _prompt("gh binary", config.github.gh_bin)
+    config.auth.api_token = _prompt("Hub API token", config.auth.api_token, required=True)
+    config.auth.ticket_secret = _prompt("Run ticket secret", config.auth.ticket_secret, required=True)
+    config.task_signing.public_key_b64 = _prompt(
+        "Task public key",
+        config.task_signing.public_key_b64,
+        required=True,
+    )
+    config.agent.workspace_root = _prompt("Workspace root", config.agent.workspace_root)
+    config.agent.poll_interval_sec = float(_prompt("Poll interval seconds", str(config.agent.poll_interval_sec)))
+    config.agent.heartbeat_interval_sec = float(
+        _prompt("Heartbeat interval seconds", str(config.agent.heartbeat_interval_sec))
+    )
+
+    saved_path = save_config(config, config_path)
+    print(f"Wrote Agent config to {saved_path}")
+    print(f"Agent ID: {config.agent.id}")
+    print(f"Hub URL: {config.hub.resolved_url()}")
+    return 0
 
 
 def cmd_package_upload(args: argparse.Namespace) -> int:
@@ -101,8 +215,6 @@ def cmd_run_submit(args: argparse.Namespace) -> int:
     request = RunCreateRequest(
         agent_id=args.agent_id,
         task_id=args.task_id,
-        package_id=args.package_id,
-        command_id=args.command_id,
     )
     with httpx.Client(timeout=20) as client:
         response = client.post(
@@ -185,7 +297,16 @@ def _add_github_store_args(parser: argparse.ArgumentParser) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="orbit", description="mvp-orbit CLI")
+    parser.add_argument("--config", default=os.getenv("ORBIT_CONFIG"), help="path to config.toml")
     sub = parser.add_subparsers(dest="command", required=True)
+
+    init = sub.add_parser("init", help="interactive configuration setup")
+    init_sub = init.add_subparsers(dest="init_command", required=True)
+    init_hub = init_sub.add_parser("hub", help="interactively create/update Hub config")
+    init_hub.set_defaults(func=cmd_init_hub)
+    init_agent = init_sub.add_parser("agent", help="interactively create/update Agent config")
+    init_agent.add_argument("--agent-id", default=None)
+    init_agent.set_defaults(func=cmd_init_agent)
 
     package = sub.add_parser("package", help="package object commands")
     package_sub = package.add_subparsers(dest="package_command", required=True)
@@ -210,7 +331,7 @@ def build_parser() -> argparse.ArgumentParser:
     task_upload.add_argument("--command-id", default=None)
     task_upload.add_argument("--constraints-file", default=None)
     task_upload.add_argument("--created-by", default=os.getenv("USER"))
-    task_upload.add_argument("--private-key", required=True)
+    task_upload.add_argument("--private-key", default=None)
     task_upload.add_argument("--signer", default=None)
     _add_github_store_args(task_upload)
     task_upload.set_defaults(func=cmd_task_upload)
@@ -219,29 +340,27 @@ def build_parser() -> argparse.ArgumentParser:
     run_sub = run.add_subparsers(dest="run_command", required=True)
 
     run_submit = run_sub.add_parser("submit", help="submit a run to Hub")
-    run_submit.add_argument("--hub-url", required=True)
-    run_submit.add_argument("--agent-id", required=True)
+    run_submit.add_argument("--hub-url", default=None)
+    run_submit.add_argument("--agent-id", default=None)
     run_submit.add_argument("--task-id", required=True)
-    run_submit.add_argument("--package-id", required=True)
-    run_submit.add_argument("--command-id", required=True)
     run_submit.add_argument("--api-token", default=os.getenv("ORBIT_API_TOKEN"))
     run_submit.set_defaults(func=cmd_run_submit)
 
     run_status = run_sub.add_parser("status", help="show run status")
-    run_status.add_argument("--hub-url", required=True)
+    run_status.add_argument("--hub-url", default=None)
     run_status.add_argument("--run-id", required=True)
     run_status.add_argument("--api-token", default=os.getenv("ORBIT_API_TOKEN"))
     run_status.set_defaults(func=cmd_run_status)
 
     run_logs = run_sub.add_parser("logs", help="fetch logs via Hub ids + GitHub objects")
-    run_logs.add_argument("--hub-url", required=True)
+    run_logs.add_argument("--hub-url", default=None)
     run_logs.add_argument("--run-id", required=True)
     run_logs.add_argument("--api-token", default=os.getenv("ORBIT_API_TOKEN"))
     _add_github_store_args(run_logs)
     run_logs.set_defaults(func=cmd_run_logs)
 
     run_result = run_sub.add_parser("result", help="fetch result via Hub id + GitHub object")
-    run_result.add_argument("--hub-url", required=True)
+    run_result.add_argument("--hub-url", default=None)
     run_result.add_argument("--run-id", required=True)
     run_result.add_argument("--api-token", default=os.getenv("ORBIT_API_TOKEN"))
     _add_github_store_args(run_result)
@@ -265,11 +384,35 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def prepare_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> argparse.Namespace:
+    config_path, config = load_config(args.config)
+    args.config = str(config_path)
+    args._orbit_config = config
+    _apply_config_defaults(args, config)
+
+    needs_github = (
+        (args.command == "package" and args.package_command == "upload")
+        or (args.command == "command" and args.command_command == "upload")
+        or (args.command == "task" and args.task_command == "upload")
+        or (args.command == "run" and args.run_command in {"logs", "result"})
+    )
+    if needs_github:
+        _validate_required(parser, args, "github_owner", "github_repo")
+
+    if args.command == "task" and args.task_command == "upload":
+        _validate_required(parser, args, "private_key")
+
+    if args.command == "run" and args.run_command in {"submit", "status", "logs", "result"}:
+        _validate_required(parser, args, "hub_url")
+    if args.command == "run" and args.run_command == "submit":
+        _validate_required(parser, args, "agent_id")
+
+    return args
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = build_parser()
-    args = parser.parse_args(argv)
-    if hasattr(args, "github_owner") and (not args.github_owner or not args.github_repo):
-        parser.error("GitHub store configuration is required for this command")
+    args = prepare_args(parser, parser.parse_args(argv))
     raise SystemExit(args.func(args))
 
 

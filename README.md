@@ -1,51 +1,110 @@
-# mvp-orbit
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="./assets/logo-dark.png">
+    <source media="(prefers-color-scheme: light)" srcset="./assets/logo-light.png">
+    <img alt="MVP Engine" src="./assets/logo-dark.png">
+  </picture>
+</p>
 
-`mvp-orbit` is a small remote-debug runtime with two planes:
+<p align="center">
+  <p align="center">
+    by MVP Lab.
+  </p>
+</p>
 
-- Content plane: GitHub Release Assets store all sensitive objects.
-- Control plane: Hub API stores only run metadata and object IDs.
 
-The runtime model is built around three objects:
+`mvp-orbit` is a small remote-debug tool for running files and commands on another machine while keeping the workflow simple.
 
-- `file_package`: a `.tar.gz` bundle of files selected from a directory.
-- `command`: structured execution JSON (`argv`, `env_patch`, `timeout_sec`, `working_dir`).
-- `task`: a signed binding of `package_id + command_id + constraints`.
+It is designed for workflows like:
 
-Hub never receives package bytes, command JSON, task content, logs, or results. Agent only gets IDs from Hub, then pulls real objects from GitHub and verifies them locally.
+- develop on one machine
+- send a file package and command to another machine
+- execute remotely through a lightweight agent
+- fetch logs and exit status back to the local side
+- iterate quickly
 
-## Security model
+It is also a good fit for AI coding tools that need:
 
-- `package_id = sha256(package_bytes)`
-- `command_id = sha256(canonical_json(command))`
-- `task_id = sha256(canonical_json(task))`
-- `task_signature = Ed25519(task canonical bytes)`
-- `run_ticket` is HMAC-protected, short-lived, and one-time through nonce replay protection
+- automatic remote test execution
+- automatic log collection
+- automatic retry and debug loops
+- a simple way to hand work from a coding agent to a target machine
 
-Agent execution checks, in order:
+Typical examples:
 
-1. `run_ticket` validity and replay
-2. `task_id` hash match
-3. `task_signature` verification
-4. `task.package_id / task.command_id` match the Hub lease IDs
-5. `package_id` and `command_id` match downloaded GitHub objects
+- develop on a GPU server, debug on an NPU server
+- prepare files on a build machine, run on a test machine
+- submit small remote debug tasks without building a full CI platform
+- let an AI coding tool submit a package, run a command remotely, and inspect the result automatically
 
-GitHub access is performed through `gh` CLI. `mvp-orbit` assumes the machine has already completed `gh auth login`.
+## What it does
 
-## Storage model
+`mvp-orbit` currently provides:
 
-v1 is GitHub-only. Objects are stored in a dedicated relay repository through GitHub Release Assets.
+- file packaging from a directory
+- Git-aware file selection that respects `.gitignore`
+- command upload as structured JSON
+- task creation from `file_package + command`
+- Hub-based run submission to a specific `agent_id`
+- Agent pull mode execution
+- stdout/stderr collection
+- exit code and final status reporting
+- GitHub-backed storage for packages, commands, tasks, logs, and results
+- interactive initialization for Hub and Agent
 
-- `package/<package_id>.tar.gz`
-- `command/<command_id>.json`
-- `task/<task_id>.json`
-- `log/<log_id>.json`
-- `result/<result_id>.json`
+In practice, this makes it useful as a lightweight execution loop for AI-assisted development:
 
-The storage layer is abstracted behind `ObjectStoreBackend`, so later backends like S3 or Hugging Face can be added without changing the run flow.
+1. the coding tool edits files locally
+2. uploads a package and command
+3. runs the task on the target machine
+4. reads logs and exit status
+5. decides the next change
+
+## Core objects
+
+The runtime is built around three objects:
+
+- `file_package`: a `.tar.gz` bundle created from a source directory
+- `command`: structured execution data such as `argv`, `env_patch`, `timeout_sec`, and `working_dir`
+- `task`: a runnable binding of `package_id + command_id`
+
+This keeps the workflow simple:
+
+1. upload files as a package
+2. upload the command
+3. create a task
+4. submit the task to a target agent
+5. read logs and result
+
+## How it runs
+
+- Hub stores run metadata and object IDs
+- Agent polls the Hub for work
+- real task content is stored in GitHub Release Assets
+- both the developer side and the agent side use the same `orbit` CLI
+- configuration is kept in a default TOML file after initialization
+
+## Current backend
+
+The current version is GitHub-only for object storage.
+
+- GitHub access is performed through `gh` CLI
+- the machine is expected to have completed `gh auth login`
+- objects are stored in a dedicated relay repository through GitHub Release Assets
+
+Storage is abstracted behind `ObjectStoreBackend`, so later backends like S3 or Hugging Face can be added without changing the run flow.
 
 ## Quick start
 
-### 1) Prerequisites
+By default, `orbit` reads configuration from:
+
+```text
+~/.config/mvp-orbit/config.toml
+```
+
+You can override that path with `--config /path/to/config.toml` or `ORBIT_CONFIG=/path/to/config.toml`, but normal usage should not need it.
+
+### Required setup
 
 - Python 3.11+
 - GitHub CLI (`gh`)
@@ -53,59 +112,72 @@ The storage layer is abstracted behind `ObjectStoreBackend`, so later backends l
 - `gh auth login` already completed on both the Hub/developer machine and the Agent machine
 - Optional proxy via `HTTPS_PROXY`
 
-The runtime now uses `gh` CLI for GitHub storage operations. You no longer need to pass `ORBIT_GITHUB_TOKEN` into `mvp-orbit`.
+#### 1) Initialize Hub config interactively
 
-### 2) Generate task signing keypair
+Run this on the Hub / developer machine:
 
 ```bash
-orbit keys generate
+orbit init hub
 ```
 
-### 3) Prepare Hub secrets
+The command prompts for:
 
-You can provide them manually:
+- GitHub relay repo settings
+- Hub bind host / port / sqlite path
+- Hub public URL
 
-```bash
-export ORBIT_TICKET_SECRET="$(python3 -c 'import secrets; print(secrets.token_urlsafe(48))')"
-export ORBIT_API_TOKEN="$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"
-```
+It also generates and stores:
 
-If you do not provide them, `orbit hub serve` will generate both values at startup and print them to stdout.
+- `api_token`
+- `ticket_secret`
+- task signing keypair
 
-Rules:
-
-- `ORBIT_TICKET_SECRET` must be identical on Hub and Agent.
-- `ORBIT_API_TOKEN` must match on Hub and all Hub clients.
-
-### 4) Export GitHub relay settings
+Then start the Hub:
 
 ```bash
-export ORBIT_GITHUB_OWNER="<owner>"
-export ORBIT_GITHUB_REPO="<relay-repo>"
-export ORBIT_GITHUB_RELEASE_PREFIX="mvp-orbit"
-```
-
-### 5) Start Hub
-
-```bash
-export ORBIT_HUB_HOST="127.0.0.1"
-export ORBIT_HUB_PORT="8080"
-export ORBIT_HUB_DB="./.orbit-hub/runs.sqlite3"
-
 orbit hub serve
 ```
 
-If `ORBIT_TICKET_SECRET` or `ORBIT_API_TOKEN` is missing, Hub will print generated values like:
+#### 2) Initialize Agent config interactively
 
-```text
-ORBIT_TICKET_SECRET=...
-ORBIT_API_TOKEN=...
-Generated missing Hub secrets for this process. Export the values above if other processes must reuse them.
+Run this on the Agent machine:
+
+```bash
+orbit init agent --agent-id agent-a
 ```
 
-Use those same values in Agent and CLI clients.
+The command prompts for:
 
-### 6) Upload a file package
+- `agent_id`
+- Hub URL
+- Hub `api_token`
+- shared `ticket_secret`
+- task signing public key
+- GitHub relay repo settings
+
+Then start the Agent:
+
+```bash
+orbit agent run
+```
+
+After this step, both Hub and Agent can use the default config file path directly.
+
+### Usage
+
+The intended day-to-day usage is that a coding AI tool such as Codex calls these CLI commands for you, instead of you typing every step manually.
+
+A typical loop looks like this:
+
+1. the coding tool edits files locally
+2. it uploads the current working tree as a file package
+3. it uploads the command to run remotely
+4. it creates a task
+5. it submits the task to a target agent
+6. it reads logs and results
+7. it decides the next code change
+
+#### 1) Upload a file package
 
 `orbit package upload` is git-aware. If the source is inside a Git repo, it uses:
 
@@ -115,10 +187,7 @@ That means `.gitignore` is respected. The selected files are packed into a deter
 
 ```bash
 orbit package upload \
-  --source-dir /path/to/project \
-  --github-owner "$ORBIT_GITHUB_OWNER" \
-  --github-repo "$ORBIT_GITHUB_REPO" \
-  --github-release-prefix "$ORBIT_GITHUB_RELEASE_PREFIX"
+  --source-dir /path/to/project
 ```
 
 Output:
@@ -126,7 +195,7 @@ Output:
 - `package_id`
 - `file_count`
 
-### 7) Upload a command object
+#### 2) Upload a command object
 
 Create `command.json`:
 
@@ -145,28 +214,24 @@ Upload it:
 
 ```bash
 orbit command upload \
-  --file command.json \
-  --github-owner "$ORBIT_GITHUB_OWNER" \
-  --github-repo "$ORBIT_GITHUB_REPO" \
-  --github-release-prefix "$ORBIT_GITHUB_RELEASE_PREFIX"
+  --file command.json
 ```
 
 Output:
 
 - `command_id`
 
-### 8) Upload a signed task object
+#### 3) Upload a signed task object
 
 ```bash
 orbit task upload \
   --package-id <PACKAGE_ID> \
   --command-id <COMMAND_ID> \
-  --private-key <ORBIT_TASK_PRIVATE_KEY_B64> \
-  --created-by "$USER" \
-  --github-owner "$ORBIT_GITHUB_OWNER" \
-  --github-repo "$ORBIT_GITHUB_REPO" \
-  --github-release-prefix "$ORBIT_GITHUB_RELEASE_PREFIX"
+  --created-by "$USER"
 ```
+
+`orbit task upload` reads the private signing key from the default config file unless you override it with `--private-key`.
+The generated task already contains `package_id` and `command_id`.
 
 Output:
 
@@ -174,16 +239,12 @@ Output:
 - `package_id`
 - `command_id`
 
-### 9) Submit a run
+#### 4) Submit a run
 
 ```bash
 orbit run submit \
-  --hub-url http://127.0.0.1:8080 \
   --agent-id agent-a \
-  --task-id <TASK_ID> \
-  --package-id <PACKAGE_ID> \
-  --command-id <COMMAND_ID> \
-  --api-token "$ORBIT_API_TOKEN"
+  --task-id <TASK_ID>
 ```
 
 Output:
@@ -191,57 +252,14 @@ Output:
 - `run_id`
 - `run_ticket`
 
-### 10) Start Agent
+#### 5) Query status, logs, and result
 
 ```bash
-export ORBIT_AGENT_ID="agent-a"
-export ORBIT_HUB_URL="http://127.0.0.1:8080"
-export ORBIT_API_TOKEN="$ORBIT_API_TOKEN"
-export ORBIT_TICKET_SECRET="$ORBIT_TICKET_SECRET"
-export ORBIT_TASK_PUBLIC_KEY_B64="<ORBIT_TASK_PUBLIC_KEY_B64>"
-
-orbit agent run
-```
-
-The agent uses the same GitHub environment variables as the upload side, but it only needs read access.
-
-### 11) Query status, logs, and result
-
-```bash
-orbit run status --hub-url http://127.0.0.1:8080 --run-id <RUN_ID> --api-token "$ORBIT_API_TOKEN"
+orbit run status --run-id <RUN_ID>
 
 orbit run logs \
-  --hub-url http://127.0.0.1:8080 \
-  --run-id <RUN_ID> \
-  --api-token "$ORBIT_API_TOKEN" \
-  --github-owner "$ORBIT_GITHUB_OWNER" \
-  --github-repo "$ORBIT_GITHUB_REPO" \
-  --github-release-prefix "$ORBIT_GITHUB_RELEASE_PREFIX"
+  --run-id <RUN_ID>
 
 orbit run result \
-  --hub-url http://127.0.0.1:8080 \
-  --run-id <RUN_ID> \
-  --api-token "$ORBIT_API_TOKEN" \
-  --github-owner "$ORBIT_GITHUB_OWNER" \
-  --github-repo "$ORBIT_GITHUB_REPO" \
-  --github-release-prefix "$ORBIT_GITHUB_RELEASE_PREFIX"
+  --run-id <RUN_ID>
 ```
-
-## Current scope
-
-Implemented:
-
-- `file_package + command + task` object model
-- GitHub Release Asset object store backend
-- Hub `/api` run submission, lease, heartbeat, completion, and status
-- Agent pull-execute-complete loop
-- Deterministic git-aware file packaging
-- Task signature verification and run ticket replay protection
-- Log/result objects stored in GitHub, referenced by Hub only through IDs
-
-Not implemented yet:
-
-- artifact upload/download
-- streaming log chunks
-- multiple object store backends
-- richer task scheduling or placement constraints

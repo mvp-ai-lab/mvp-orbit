@@ -82,8 +82,6 @@ class RunCreateRequest(BaseModel):
 
     agent_id: str = Field(min_length=1)
     task_id: str = Field(min_length=8)
-    package_id: str = Field(min_length=8)
-    command_id: str = Field(min_length=8)
 
 
 class RunCreateResponse(BaseModel):
@@ -92,8 +90,6 @@ class RunCreateResponse(BaseModel):
     run_id: str
     agent_id: str
     task_id: str
-    package_id: str
-    command_id: str
     run_ticket: str
     expires_at: datetime
 
@@ -104,8 +100,6 @@ class RunLease(BaseModel):
     run_id: str
     agent_id: str
     task_id: str
-    package_id: str
-    command_id: str
     run_ticket: str
     expires_at: datetime
 
@@ -116,8 +110,6 @@ class TicketPayload(BaseModel):
     run_id: str
     agent_id: str
     task_id: str
-    package_id: str
-    command_id: str
     nonce: str
     issued_at: datetime
     expires_at: datetime
@@ -152,8 +144,6 @@ class RunRecord(BaseModel):
     run_id: str
     agent_id: str
     task_id: str
-    package_id: str
-    command_id: str
     run_ticket: str
     expires_at: datetime
     status: RunStatus

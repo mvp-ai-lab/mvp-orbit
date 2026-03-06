@@ -26,8 +26,6 @@ class RunStore:
                     run_id TEXT PRIMARY KEY,
                     agent_id TEXT NOT NULL,
                     task_id TEXT NOT NULL,
-                    package_id TEXT NOT NULL,
-                    command_id TEXT NOT NULL,
                     run_ticket TEXT NOT NULL,
                     expires_at TEXT NOT NULL,
                     status TEXT NOT NULL,
@@ -48,11 +46,11 @@ class RunStore:
             self._conn.execute(
                 """
                 INSERT INTO runs (
-                    run_id, agent_id, task_id, package_id, command_id,
+                    run_id, agent_id, task_id,
                     run_ticket, expires_at, status, created_at,
                     leased_at, heartbeat_at, completed_at,
                     log_ids, result_id, artifact_ids, failure_code
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 self._row_values(record),
             )
@@ -132,8 +130,6 @@ class RunStore:
             record.run_id,
             record.agent_id,
             record.task_id,
-            record.package_id,
-            record.command_id,
             record.run_ticket,
             record.expires_at.isoformat(),
             record.status.value,
@@ -153,8 +149,6 @@ class RunStore:
             run_id=row["run_id"],
             agent_id=row["agent_id"],
             task_id=row["task_id"],
-            package_id=row["package_id"],
-            command_id=row["command_id"],
             run_ticket=row["run_ticket"],
             expires_at=_parse_dt(row["expires_at"]),
             status=RunStatus(row["status"]),

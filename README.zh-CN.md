@@ -1,51 +1,109 @@
-# mvp-orbit
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="./assets/logo-dark.png">
+    <source media="(prefers-color-scheme: light)" srcset="./assets/logo-light.png">
+    <img alt="MVP Engine" src="./assets/logo-dark.png">
+  </picture>
+</p>
 
-`mvp-orbit` 是一个轻量级远程调试运行时，包含两个平面：
+<p align="center">
+  <p align="center">
+    by MVP Lab.
+  </p>
+</p>
 
-- 内容平面：所有敏感对象都存放在 GitHub Release Assets 中。
-- 控制平面：Hub API 只保存运行元数据和对象 ID。
+`mvp-orbit` 是一个轻量级远程调试工具，用来把文件和命令发送到另一台机器执行，并把结果再取回来。
+
+它适合这类场景：
+
+- 在一台机器上开发
+- 把文件包和命令发送到另一台机器
+- 通过轻量 Agent 远程执行
+- 拉回日志、退出码和最终状态
+- 根据结果继续迭代
+
+它也非常适合 AI coding 工具这类自动化场景：
+
+- 自动提交远程测试任务
+- 自动收集日志
+- 自动进入重试和 debug 循环
+- 把 coding agent 的执行请求转交给目标机器
+
+典型例子：
+
+- 在 GPU 机器上开发，在 NPU 机器上调试
+- 在构建机准备文件，在测试机执行
+- 不想搭完整 CI 平台，只想快速做远程调试任务
+- 让 AI coding 工具自动上传文件包、远程执行命令，并根据结果继续修改代码
+
+## 功能概览
+
+当前版本提供这些能力：
+
+- 从目录打包文件
+- 基于 Git 选择文件，并遵循 `.gitignore`
+- 以结构化 JSON 上传命令
+- 由 `file_package + command` 组成 task
+- 通过 Hub 把任务投递给指定 `agent_id`
+- Agent 以 pull 模式拉取并执行任务
+- 采集 stdout/stderr
+- 回传 exit code 和最终状态
+- 用 GitHub 存储文件包、命令、task、日志和结果
+- 提供 Hub 和 Agent 的交互式初始化
+
+从实际使用上看，它很适合作为 AI 辅助开发的轻量执行闭环：
+
+1. coding 工具在本地修改文件
+2. 上传文件包和命令
+3. 在目标机器执行 task
+4. 回收日志和退出状态
+5. 决定下一轮修改
+
+## 核心对象
 
 运行时围绕三个对象构建：
 
-- `file_package`：从目录中筛选文件后打成的 `.tar.gz` 包。
-- `command`：结构化执行 JSON，包含 `argv`、`env_patch`、`timeout_sec`、`working_dir`。
-- `task`：对 `package_id + command_id + constraints` 进行签名绑定后的对象。
+- `file_package`：从源目录打成的 `.tar.gz` 文件包
+- `command`：结构化执行数据，包含 `argv`、`env_patch`、`timeout_sec`、`working_dir`
+- `task`：把 `package_id + command_id` 绑定成一次可运行任务
 
-Hub 不接收文件包、命令 JSON、task 内容、日志正文或结果正文。Agent 只从 Hub 获取 ID，然后再去 GitHub 拉取真实对象并在本地校验。
+这样使用流程会比较清晰：
 
-## 安全模型
+1. 上传文件包
+2. 上传命令
+3. 创建 task
+4. 提交到目标 agent
+5. 查看日志和结果
 
-- `package_id = sha256(package_bytes)`
-- `command_id = sha256(canonical_json(command))`
-- `task_id = sha256(canonical_json(task))`
-- `task_signature = Ed25519(task canonical bytes)`
-- `run_ticket` 使用 HMAC 保护，带短时效，并通过 nonce 防止重放
+## 运行方式
 
-Agent 执行前会按顺序校验：
+- Hub 负责保存运行元数据和对象 ID
+- Agent 轮询 Hub 获取任务
+- 真实任务内容存放在 GitHub Release Assets
+- 开发机和 Agent 机都使用同一个 `orbit` CLI
+- 初始化之后默认使用同一份 TOML 配置
 
-1. `run_ticket` 是否有效且未重放
-2. `task_id` 是否与内容哈希一致
-3. `task_signature` 是否验证通过
-4. `task.package_id / task.command_id` 是否与 Hub 下发的 lease ID 一致
-5. 从 GitHub 下载的 `package` 和 `command` 是否与对应 ID 一致
+## 当前后端
 
-GitHub 访问通过 `gh` CLI 完成。`mvp-orbit` 默认假设当前机器已经执行过 `gh auth login`。
+当前版本只实现了 GitHub 存储后端。
 
-## 存储模型
-
-v1 仅支持 GitHub。对象统一存放在独立 relay 仓库的 GitHub Release Assets 中。
-
-- `package/<package_id>.tar.gz`
-- `command/<command_id>.json`
-- `task/<task_id>.json`
-- `log/<log_id>.json`
-- `result/<result_id>.json`
+- GitHub 操作通过 `gh` CLI 完成
+- 机器上需要先执行过 `gh auth login`
+- 对象统一存放在独立 relay 仓库的 GitHub Release Assets 中
 
 存储层通过 `ObjectStoreBackend` 抽象，后续扩展到 S3、Hugging Face 等后端时，不需要改执行链路。
 
 ## 快速开始
 
-### 1) 前置条件
+默认情况下，`orbit` 会从这里读取配置：
+
+```text
+~/.config/mvp-orbit/config.toml
+```
+
+你可以通过 `--config /path/to/config.toml` 或 `ORBIT_CONFIG=/path/to/config.toml` 覆盖它，但正常使用不应该再需要显式传配置路径。
+
+### 必需配置
 
 - Python 3.11+
 - GitHub CLI (`gh`)
@@ -53,59 +111,72 @@ v1 仅支持 GitHub。对象统一存放在独立 relay 仓库的 GitHub Release
 - Hub/开发机与 Agent 机器上都已经完成 `gh auth login`
 - 如需代理，可设置 `HTTPS_PROXY`
 
-当前版本通过 `gh` CLI 完成 GitHub 存储读写，不再需要给 `mvp-orbit` 传入 `ORBIT_GITHUB_TOKEN`。
+#### 1) 交互式初始化 Hub 配置
 
-### 2) 生成 task 签名密钥对
+在 Hub / 开发机上执行：
 
 ```bash
-orbit keys generate
+orbit init hub
 ```
 
-### 3) 准备 Hub secrets
+该命令会交互式询问：
 
-你可以手动提供：
+- GitHub relay 仓库配置
+- Hub 监听 host / port / sqlite 路径
+- Hub 对外 URL
 
-```bash
-export ORBIT_TICKET_SECRET="$(python3 -c 'import secrets; print(secrets.token_urlsafe(48))')"
-export ORBIT_API_TOKEN="$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"
-```
+并自动生成并写入：
 
-如果不提供，`orbit hub serve` 会在启动时自动生成这两个值，并打印到标准输出。
+- `api_token`
+- `ticket_secret`
+- task 签名密钥对
 
-规则：
-
-- `ORBIT_TICKET_SECRET` 在 Hub 和 Agent 上必须完全一致。
-- `ORBIT_API_TOKEN` 在 Hub 和所有 Hub 客户端上必须完全一致。
-
-### 4) 导出 GitHub relay 配置
+然后启动 Hub：
 
 ```bash
-export ORBIT_GITHUB_OWNER="<owner>"
-export ORBIT_GITHUB_REPO="<relay-repo>"
-export ORBIT_GITHUB_RELEASE_PREFIX="mvp-orbit"
-```
-
-### 5) 启动 Hub
-
-```bash
-export ORBIT_HUB_HOST="127.0.0.1"
-export ORBIT_HUB_PORT="8080"
-export ORBIT_HUB_DB="./.orbit-hub/runs.sqlite3"
-
 orbit hub serve
 ```
 
-如果缺少 `ORBIT_TICKET_SECRET` 或 `ORBIT_API_TOKEN`，Hub 会打印类似下面的内容：
+#### 2) 交互式初始化 Agent 配置
 
-```text
-ORBIT_TICKET_SECRET=...
-ORBIT_API_TOKEN=...
-Generated missing Hub secrets for this process. Export the values above if other processes must reuse them.
+在 Agent 机器上执行：
+
+```bash
+orbit init agent --agent-id agent-a
 ```
 
-之后需要把这些相同的值提供给 Agent 和 CLI 客户端。
+该命令会交互式询问：
 
-### 6) 上传文件包
+- `agent_id`
+- Hub URL
+- Hub `api_token`
+- 共享的 `ticket_secret`
+- task 公钥
+- GitHub relay 仓库配置
+
+然后启动 Agent：
+
+```bash
+orbit agent run
+```
+
+完成这一步后，Hub 和 Agent 后续都可以直接使用默认配置路径运行。
+
+### 使用
+
+更推荐的日常使用方式是：让 Codex 这类 coding AI 工具自动调用这些 CLI，而不是人工逐条输入。
+
+一个典型闭环是：
+
+1. coding AI 在本地修改文件
+2. 自动把当前工作目录上传成文件包
+3. 自动上传要远程执行的命令
+4. 自动创建 task
+5. 自动提交到目标 agent
+6. 自动读取日志和结果
+7. 根据结果决定下一轮修改
+
+#### 1) 上传文件包
 
 `orbit package upload` 具备 Git 感知能力。如果源目录位于 Git 仓库中，它会使用：
 
@@ -115,10 +186,7 @@ Generated missing Hub secrets for this process. Export the values above if other
 
 ```bash
 orbit package upload \
-  --source-dir /path/to/project \
-  --github-owner "$ORBIT_GITHUB_OWNER" \
-  --github-repo "$ORBIT_GITHUB_REPO" \
-  --github-release-prefix "$ORBIT_GITHUB_RELEASE_PREFIX"
+  --source-dir /path/to/project
 ```
 
 输出：
@@ -126,7 +194,7 @@ orbit package upload \
 - `package_id`
 - `file_count`
 
-### 7) 上传 command 对象
+#### 2) 上传 command 对象
 
 先创建 `command.json`：
 
@@ -145,28 +213,24 @@ orbit package upload \
 
 ```bash
 orbit command upload \
-  --file command.json \
-  --github-owner "$ORBIT_GITHUB_OWNER" \
-  --github-repo "$ORBIT_GITHUB_REPO" \
-  --github-release-prefix "$ORBIT_GITHUB_RELEASE_PREFIX"
+  --file command.json
 ```
 
 输出：
 
 - `command_id`
 
-### 8) 上传签名后的 task 对象
+#### 3) 上传签名后的 task 对象
 
 ```bash
 orbit task upload \
   --package-id <PACKAGE_ID> \
   --command-id <COMMAND_ID> \
-  --private-key <ORBIT_TASK_PRIVATE_KEY_B64> \
-  --created-by "$USER" \
-  --github-owner "$ORBIT_GITHUB_OWNER" \
-  --github-repo "$ORBIT_GITHUB_REPO" \
-  --github-release-prefix "$ORBIT_GITHUB_RELEASE_PREFIX"
+  --created-by "$USER"
 ```
+
+`orbit task upload` 默认会从配置文件里读取私钥；只有你想临时覆盖时才需要显式传 `--private-key`。
+生成出来的 task 本身已经包含 `package_id` 和 `command_id`。
 
 输出：
 
@@ -174,16 +238,12 @@ orbit task upload \
 - `package_id`
 - `command_id`
 
-### 9) 提交运行任务
+#### 4) 提交运行任务
 
 ```bash
 orbit run submit \
-  --hub-url http://127.0.0.1:8080 \
   --agent-id agent-a \
-  --task-id <TASK_ID> \
-  --package-id <PACKAGE_ID> \
-  --command-id <COMMAND_ID> \
-  --api-token "$ORBIT_API_TOKEN"
+  --task-id <TASK_ID>
 ```
 
 输出：
@@ -191,57 +251,14 @@ orbit run submit \
 - `run_id`
 - `run_ticket`
 
-### 10) 启动 Agent
+#### 5) 查询状态、日志和结果
 
 ```bash
-export ORBIT_AGENT_ID="agent-a"
-export ORBIT_HUB_URL="http://127.0.0.1:8080"
-export ORBIT_API_TOKEN="$ORBIT_API_TOKEN"
-export ORBIT_TICKET_SECRET="$ORBIT_TICKET_SECRET"
-export ORBIT_TASK_PUBLIC_KEY_B64="<ORBIT_TASK_PUBLIC_KEY_B64>"
-
-orbit agent run
-```
-
-Agent 使用与上传侧相同的 GitHub 环境变量，但只需要只读权限。
-
-### 11) 查询状态、日志和结果
-
-```bash
-orbit run status --hub-url http://127.0.0.1:8080 --run-id <RUN_ID> --api-token "$ORBIT_API_TOKEN"
+orbit run status --run-id <RUN_ID>
 
 orbit run logs \
-  --hub-url http://127.0.0.1:8080 \
-  --run-id <RUN_ID> \
-  --api-token "$ORBIT_API_TOKEN" \
-  --github-owner "$ORBIT_GITHUB_OWNER" \
-  --github-repo "$ORBIT_GITHUB_REPO" \
-  --github-release-prefix "$ORBIT_GITHUB_RELEASE_PREFIX"
+  --run-id <RUN_ID>
 
 orbit run result \
-  --hub-url http://127.0.0.1:8080 \
-  --run-id <RUN_ID> \
-  --api-token "$ORBIT_API_TOKEN" \
-  --github-owner "$ORBIT_GITHUB_OWNER" \
-  --github-repo "$ORBIT_GITHUB_REPO" \
-  --github-release-prefix "$ORBIT_GITHUB_RELEASE_PREFIX"
+  --run-id <RUN_ID>
 ```
-
-## 当前范围
-
-已实现：
-
-- `file_package + command + task` 对象模型
-- GitHub Release Asset 对象存储后端
-- Hub `/api` 的 run 提交、lease、heartbeat、complete 和状态查询
-- Agent 的 pull-execute-complete 执行循环
-- 确定性的 Git 感知文件打包
-- task 签名校验和 run ticket 重放保护
-- 日志/结果存放于 GitHub，Hub 只保存对象 ID
-
-尚未实现：
-
-- artifact 上传/下载
-- 流式日志分片
-- 多对象存储后端
-- 更丰富的调度或 placement constraint

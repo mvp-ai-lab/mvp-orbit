@@ -68,16 +68,12 @@ def create_app(
             run_id=run_id,
             agent_id=request.agent_id,
             task_id=request.task_id,
-            package_id=request.package_id,
-            command_id=request.command_id,
             expires_at=expires_at,
         )
         record = RunRecord(
             run_id=run_id,
             agent_id=request.agent_id,
             task_id=request.task_id,
-            package_id=request.package_id,
-            command_id=request.command_id,
             run_ticket=run_ticket,
             expires_at=expires_at,
             status=RunStatus.QUEUED,
@@ -88,8 +84,6 @@ def create_app(
             run_id=run_id,
             agent_id=request.agent_id,
             task_id=request.task_id,
-            package_id=request.package_id,
-            command_id=request.command_id,
             run_ticket=run_ticket,
             expires_at=expires_at,
         )
@@ -99,7 +93,7 @@ def create_app(
         record = run_store.lease_next(agent_id)
         if record is None:
             return Response(status_code=status.HTTP_204_NO_CONTENT)
-        return record.model_dump(mode="json", include={"run_id", "agent_id", "task_id", "package_id", "command_id", "run_ticket", "expires_at"})
+        return record.model_dump(mode="json", include={"run_id", "agent_id", "task_id", "run_ticket", "expires_at"})
 
     @app.post("/api/runs/{run_id}/heartbeat", dependencies=[Depends(require_auth)])
     def heartbeat(run_id: str, heartbeat_request: RunHeartbeatRequest) -> dict[str, str]:

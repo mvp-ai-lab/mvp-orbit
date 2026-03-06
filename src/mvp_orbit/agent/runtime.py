@@ -50,10 +50,10 @@ class AgentRuntime:
 
     def handle_run(self, lease: RunLease, *, heartbeat: Callable[[str], None] | None = None) -> ExecutionOutcome:
         try:
-            command = self._validate_and_load_objects(lease)
+            package_id, command = self._validate_and_load_objects(lease)
             if heartbeat is not None:
                 heartbeat("preparing")
-            workspace = self._prepare_workspace(lease.run_id, lease.package_id)
+            workspace = self._prepare_workspace(lease.run_id, package_id)
             return self._execute_command(lease, command, workspace, heartbeat)
         except Exception as exc:
             now = datetime.now(timezone.utc)
@@ -90,8 +90,6 @@ class AgentRuntime:
             ticket.run_id != lease.run_id
             or ticket.agent_id != lease.agent_id
             or ticket.task_id != lease.task_id
-            or ticket.package_id != lease.package_id
-            or ticket.command_id != lease.command_id
         ):
             raise RuntimeError("ticket claims do not match run lease")
 
@@ -103,18 +101,18 @@ class AgentRuntime:
         except SignatureError as exc:
             raise RuntimeError(f"task signature verification failed: {exc}") from exc
 
-        if signed_task.task.package_id != lease.package_id or signed_task.task.command_id != lease.command_id:
-            raise RuntimeError("task object does not match run lease ids")
+        package_id = signed_task.task.package_id
+        command_id = signed_task.task.command_id
 
-        command = self.object_store.get_command(lease.command_id)
+        command = self.object_store.get_command(command_id)
         require_matching_json_object_id(
-            lease.command_id,
+            command_id,
             command.model_dump(mode="json", exclude_none=True),
         )
 
-        package_bytes = self.object_store.get_package(lease.package_id)
-        require_matching_object_id(lease.package_id, package_bytes)
-        return command
+        package_bytes = self.object_store.get_package(package_id)
+        require_matching_object_id(package_id, package_bytes)
+        return package_id, command
 
     def _prepare_workspace(self, run_id: str, package_id: str) -> Path:
         workspace = self.workspace_root / run_id

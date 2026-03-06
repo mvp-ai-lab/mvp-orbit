@@ -65,7 +65,7 @@ def test_end_to_end_run_flow_uses_ids_only(tmp_path):
     client = TestClient(app)
     submit = client.post(
         "/api/runs",
-        json=RunCreateRequest(agent_id="agent-a", task_id=task_id, package_id=package_id, command_id=command_id).model_dump(mode="json"),
+        json=RunCreateRequest(agent_id="agent-a", task_id=task_id).model_dump(mode="json"),
         headers={"Authorization": "Bearer api-token"},
     )
     assert submit.status_code == 200
@@ -74,7 +74,7 @@ def test_end_to_end_run_flow_uses_ids_only(tmp_path):
 
     next_resp = client.get("/api/agents/agent-a/next", headers={"Authorization": "Bearer api-token"})
     lease_payload = next_resp.json()
-    assert set(lease_payload) == {"run_id", "agent_id", "task_id", "package_id", "command_id", "run_ticket", "expires_at"}
+    assert set(lease_payload) == {"run_id", "agent_id", "task_id", "run_ticket", "expires_at"}
 
     runtime = AgentRuntime(
         agent_id="agent-a",
@@ -113,7 +113,7 @@ def test_end_to_end_run_flow_uses_ids_only(tmp_path):
     assert any("hello-orbit" in log.data for log in logs)
 
 
-def test_agent_rejects_tampered_run_ids(tmp_path):
+def test_agent_rejects_tampered_task_id(tmp_path):
     store = _build_store()
     private_key, public_key = generate_keypair_b64()
 
@@ -122,28 +122,24 @@ def test_agent_rejects_tampered_run_ids(tmp_path):
     (source_dir / "payload.txt").write_text("safe", encoding="utf-8")
     package_build = build_file_package(source_dir)
     package_id = store.put_package(package_build.archive_path.read_bytes())
-    other_package_id = store.put_package(b"not-a-real-package")
 
     command = CommandObject(argv=[sys.executable, "-c", "print('ignored')"], working_dir=".")
     command_id = store.put_command(command)
     signed_task = _signed_task(package_id, command_id, private_key)
     task_id = store.put_signed_task(signed_task)
+    other_task_id = "sha256-" + ("0" * 64)
 
     ticket_mgr = RunTicketManager("s" * 32)
     run_ticket, _ = ticket_mgr.issue(
         run_id="run-1",
         agent_id="agent-a",
-        task_id=task_id,
-        package_id=other_package_id,
-        command_id=command_id,
+        task_id=other_task_id,
         expires_at=datetime.now(timezone.utc) + timedelta(seconds=120),
     )
     lease = RunLease(
         run_id="run-1",
         agent_id="agent-a",
         task_id=task_id,
-        package_id=other_package_id,
-        command_id=command_id,
         run_ticket=run_ticket,
         expires_at=datetime.now(timezone.utc) + timedelta(seconds=120),
     )
@@ -179,16 +175,12 @@ def test_task_signature_forgery_is_rejected(tmp_path):
         run_id="run-2",
         agent_id="agent-a",
         task_id=task_id,
-        package_id=package_id,
-        command_id=command_id,
         expires_at=datetime.now(timezone.utc) + timedelta(seconds=120),
     )
     lease = RunLease(
         run_id="run-2",
         agent_id="agent-a",
         task_id=task_id,
-        package_id=package_id,
-        command_id=command_id,
         run_ticket=run_ticket,
         expires_at=datetime.now(timezone.utc) + timedelta(seconds=120),
     )
@@ -223,16 +215,12 @@ def test_run_ticket_replay_is_rejected(tmp_path):
         run_id="run-3",
         agent_id="agent-a",
         task_id=task_id,
-        package_id=package_id,
-        command_id=command_id,
         expires_at=datetime.now(timezone.utc) + timedelta(seconds=120),
     )
     lease = RunLease(
         run_id="run-3",
         agent_id="agent-a",
         task_id=task_id,
-        package_id=package_id,
-        command_id=command_id,
         run_ticket=run_ticket,
         expires_at=datetime.now(timezone.utc) + timedelta(seconds=120),
     )
