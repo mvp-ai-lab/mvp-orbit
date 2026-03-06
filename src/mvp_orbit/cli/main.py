@@ -300,6 +300,30 @@ def cmd_run_result(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_relay_clean(args: argparse.Namespace) -> int:
+    if not args.yes:
+        raise SystemExit("relay clean is destructive; re-run with --yes")
+    backend = GitHubGhCliBackend(
+        owner=args.github_owner,
+        repo=args.github_repo,
+        release_prefix=args.github_release_prefix,
+        gh_bin=args.gh_bin,
+    )
+    deleted = backend.purge_managed_releases()
+    print(
+        json.dumps(
+            {
+                "repo": f"{args.github_owner}/{args.github_repo}",
+                "release_prefix": args.github_release_prefix,
+                "deleted_releases": deleted,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
+    return 0
+
+
 def cmd_agent_run(args: argparse.Namespace) -> int:
     from mvp_orbit.agent.main import main as agent_main
 
@@ -410,6 +434,13 @@ def build_parser() -> argparse.ArgumentParser:
     _add_github_store_args(run_result)
     run_result.set_defaults(func=cmd_run_result)
 
+    relay = sub.add_parser("relay", help="relay repository maintenance commands")
+    relay_sub = relay.add_subparsers(dest="relay_command", required=True)
+    relay_clean = relay_sub.add_parser("clean", help="delete mvp-orbit managed releases in the relay repo")
+    relay_clean.add_argument("--yes", action="store_true", help="confirm deletion")
+    _add_github_store_args(relay_clean)
+    relay_clean.set_defaults(func=cmd_relay_clean)
+
     agent = sub.add_parser("agent", help="agent commands")
     agent_sub = agent.add_subparsers(dest="agent_command", required=True)
     agent_run = agent_sub.add_parser("run", help="run the polling agent")
@@ -439,6 +470,7 @@ def prepare_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> a
         or (args.command == "command" and args.command_command == "upload")
         or (args.command == "task" and args.task_command == "upload")
         or (args.command == "run" and args.run_command in {"logs", "result"})
+        or (args.command == "relay" and args.relay_command == "clean")
     )
     if needs_github:
         _validate_required(parser, args, "github_owner", "github_repo")

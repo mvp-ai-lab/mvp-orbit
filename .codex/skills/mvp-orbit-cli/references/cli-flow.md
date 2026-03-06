@@ -139,6 +139,17 @@ orbit run result --run-id <RUN_ID>
 orbit run cancel --run-id <RUN_ID>
 ```
 
+### Clean relay content
+
+```bash
+orbit relay clean --yes
+```
+
+Notes:
+
+- This is destructive.
+- It deletes the managed releases under the configured `release_prefix-*` namespace in the relay repository.
+
 Result shape:
 
 ```json

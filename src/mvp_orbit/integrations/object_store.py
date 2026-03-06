@@ -198,6 +198,27 @@ class GitHubGhCliBackend:
     def get_meta(self, namespace: ObjectNamespace, object_id: str, *, filename: str) -> StoredObjectMeta:
         return self._meta(namespace, object_id, self._get_asset(namespace, object_id, filename))
 
+    def purge_managed_releases(self) -> list[str]:
+        deleted: list[str] = []
+        for namespace in ObjectNamespace:
+            release_tag = self._release_tag(namespace)
+            result = self._run_gh(
+                ["release", "view", release_tag, "--repo", self.repo_ref, "--json", "name"],
+                check=False,
+            )
+            if result.returncode != 0:
+                stderr = (result.stderr or "").strip()
+                stdout = (result.stdout or "").strip()
+                if self._is_release_missing(stderr, stdout):
+                    continue
+                message = stderr or stdout or f"failed to inspect release {release_tag}"
+                raise RuntimeError(f"gh command failed: {message}")
+            self._run_gh(
+                ["release", "delete", release_tag, "--repo", self.repo_ref, "--yes"],
+            )
+            deleted.append(release_tag)
+        return deleted
+
     def _meta(self, namespace: ObjectNamespace, object_id: str, asset: dict) -> StoredObjectMeta:
         return StoredObjectMeta(
             namespace=namespace,

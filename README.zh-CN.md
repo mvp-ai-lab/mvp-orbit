@@ -272,3 +272,13 @@ orbit run cancel \
 
 `orbit run logs --follow` 会随着日志分片到达持续打印 stdout/stderr。
 Agent 默认每 10 秒上传一次日志分片；如果缓冲输出超过 16 KiB，也会提前上传。
+
+#### 6) 清理 relay 仓库内容
+
+如果你想把 relay 仓库里由 `mvp-orbit` 管理的内容全部清掉，回到干净状态：
+
+```bash
+orbit relay clean --yes
+```
+
+这个命令会删除当前 `release_prefix-*` 命名空间下的 managed releases。

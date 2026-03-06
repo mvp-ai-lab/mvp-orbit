@@ -273,3 +273,13 @@ orbit run cancel \
 
 `orbit run logs --follow` prints streamed stdout/stderr as log chunks arrive.
 The Agent uploads log chunks every 10 seconds by default, or earlier when buffered output exceeds 16 KiB.
+
+#### 6) Clean relay repository content
+
+If you want to remove all `mvp-orbit` managed content from the relay repository and start from a clean state:
+
+```bash
+orbit relay clean --yes
+```
+
+This deletes the managed releases under the current `release_prefix-*` namespace.

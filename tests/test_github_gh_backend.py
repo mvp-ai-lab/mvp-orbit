@@ -45,3 +45,26 @@ def test_ensure_release_does_not_create_on_unrelated_view_error(monkeypatch):
 
     with pytest.raises(RuntimeError, match="Proxy Authentication Required"):
         backend._ensure_release(ObjectNamespace.PACKAGE)
+
+
+def test_purge_managed_releases_deletes_existing_tags(monkeypatch):
+    monkeypatch.setattr("shutil.which", lambda _: "/usr/bin/gh")
+    backend = GitHubGhCliBackend("owner", "repo")
+
+    deleted: list[str] = []
+
+    def fake_run(args: list[str], *, check: bool = True):
+        if args[:2] == ["release", "view"]:
+            tag = args[2]
+            if tag in {"mvp-orbit-package", "mvp-orbit-log"}:
+                return _cp(args, 0, stdout='{"name":"ok"}')
+            return _cp(args, 1, stderr="release not found")
+        if args[:2] == ["release", "delete"]:
+            deleted.append(args[2])
+            return _cp(args, 0)
+        raise AssertionError(args)
+
+    monkeypatch.setattr(backend, "_run_gh", fake_run)
+
+    assert backend.purge_managed_releases() == ["mvp-orbit-package", "mvp-orbit-log"]
+    assert deleted == ["mvp-orbit-package", "mvp-orbit-log"]
