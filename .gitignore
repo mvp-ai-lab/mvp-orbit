@@ -1,0 +1,14 @@
+.venv/
+.pytest_cache/
+__pycache__/
+*.py[cod]
+
+build/
+dist/
+*.egg-info/
+
+.orbit-hub/
+.orbit-workspaces/
+.orbit-snapshots/
+
+.DS_Store

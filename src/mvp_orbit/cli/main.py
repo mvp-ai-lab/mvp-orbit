@@ -1,0 +1,277 @@
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+from pathlib import Path
+
+import httpx
+
+from mvp_orbit.cli.package import build_file_package
+from mvp_orbit.core.canonical import object_id_for_json
+from mvp_orbit.core.models import CommandObject, RunCreateRequest, SignedTaskObject, TaskObject, utc_now
+from mvp_orbit.core.signing import generate_keypair_b64, sign_payload
+from mvp_orbit.integrations.object_store import GitHubGhCliBackend, ObjectStore
+
+
+def _read_private_key(value: str) -> str:
+    maybe_file = Path(value)
+    if maybe_file.exists():
+        return maybe_file.read_text(encoding="utf-8").strip()
+    return value.strip()
+
+
+def _headers(api_token: str | None) -> dict[str, str]:
+    headers = {"Accept": "application/json"}
+    if api_token:
+        headers["Authorization"] = f"Bearer {api_token}"
+    return headers
+
+
+def _build_object_store(args: argparse.Namespace) -> ObjectStore:
+    backend = GitHubGhCliBackend(
+        owner=args.github_owner,
+        repo=args.github_repo,
+        release_prefix=args.github_release_prefix,
+        gh_bin=args.gh_bin,
+    )
+    return ObjectStore(backend)
+
+
+def _load_json(path: str) -> dict:
+    return json.loads(Path(path).read_text(encoding="utf-8"))
+
+
+def cmd_package_upload(args: argparse.Namespace) -> int:
+    build = build_file_package(args.source_dir, tmp_dir=args.tmp_dir)
+    try:
+        store = _build_object_store(args)
+        package_id = store.put_package(build.archive_path.read_bytes())
+        print(json.dumps({"package_id": package_id, "file_count": build.file_count}, ensure_ascii=False))
+        return 0
+    finally:
+        shutil.rmtree(build.archive_path.parent, ignore_errors=True)
+
+
+def cmd_command_upload(args: argparse.Namespace) -> int:
+    command = CommandObject.model_validate(_load_json(args.file))
+    store = _build_object_store(args)
+    command_id = store.put_command(command)
+    print(json.dumps({"command_id": command_id}, ensure_ascii=False))
+    return 0
+
+
+def cmd_task_upload(args: argparse.Namespace) -> int:
+    if args.file:
+        task = TaskObject.model_validate(_load_json(args.file))
+    else:
+        if not args.package_id or not args.command_id:
+            raise SystemExit("--package-id and --command-id are required when --file is not provided")
+        constraints = _load_json(args.constraints_file) if args.constraints_file else {}
+        task = TaskObject(
+            package_id=args.package_id,
+            command_id=args.command_id,
+            constraints=constraints,
+            created_by=args.created_by,
+            created_at=utc_now(),
+        )
+
+    task_payload = task.model_dump(mode="json", exclude_none=True)
+    task_id = object_id_for_json(task_payload)
+    signature = sign_payload(task_payload, _read_private_key(args.private_key))
+    signed_task = SignedTaskObject(
+        task_id=task_id,
+        task=task,
+        task_signature=signature,
+        signer=args.signer,
+    )
+    store = _build_object_store(args)
+    store.put_signed_task(signed_task)
+    print(
+        json.dumps(
+            {"task_id": task_id, "package_id": task.package_id, "command_id": task.command_id},
+            ensure_ascii=False,
+        )
+    )
+    return 0
+
+
+def cmd_run_submit(args: argparse.Namespace) -> int:
+    request = RunCreateRequest(
+        agent_id=args.agent_id,
+        task_id=args.task_id,
+        package_id=args.package_id,
+        command_id=args.command_id,
+    )
+    with httpx.Client(timeout=20) as client:
+        response = client.post(
+            f"{args.hub_url}/api/runs",
+            headers=_headers(args.api_token),
+            json=request.model_dump(mode="json"),
+        )
+        response.raise_for_status()
+        print(json.dumps(response.json(), ensure_ascii=False))
+    return 0
+
+
+def cmd_run_status(args: argparse.Namespace) -> int:
+    with httpx.Client(timeout=20) as client:
+        response = client.get(f"{args.hub_url}/api/runs/{args.run_id}", headers=_headers(args.api_token))
+        response.raise_for_status()
+        print(json.dumps(response.json(), ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_run_logs(args: argparse.Namespace) -> int:
+    with httpx.Client(timeout=20) as client:
+        response = client.get(f"{args.hub_url}/api/runs/{args.run_id}", headers=_headers(args.api_token))
+        response.raise_for_status()
+        run_record = response.json()
+
+    store = _build_object_store(args)
+    logs = [store.get_log(log_id).model_dump(mode="json") for log_id in run_record.get("log_ids", [])]
+    print(json.dumps({"run_id": args.run_id, "logs": logs}, ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_run_result(args: argparse.Namespace) -> int:
+    with httpx.Client(timeout=20) as client:
+        response = client.get(f"{args.hub_url}/api/runs/{args.run_id}", headers=_headers(args.api_token))
+        response.raise_for_status()
+        run_record = response.json()
+
+    result_id = run_record.get("result_id")
+    if not result_id:
+        print(json.dumps({"run_id": args.run_id, "result": None}, ensure_ascii=False, indent=2))
+        return 0
+
+    store = _build_object_store(args)
+    result = store.get_result(result_id).model_dump(mode="json")
+    print(json.dumps({"run_id": args.run_id, "result": result}, ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_agent_run(args: argparse.Namespace) -> int:
+    from mvp_orbit.agent.main import main as agent_main
+
+    agent_main()
+    return 0
+
+
+def cmd_hub_serve(args: argparse.Namespace) -> int:
+    from mvp_orbit.hub.app import main as hub_main
+
+    hub_main()
+    return 0
+
+
+def cmd_keys_generate(args: argparse.Namespace) -> int:
+    private_key, public_key = generate_keypair_b64()
+    print(f"ORBIT_TASK_PRIVATE_KEY_B64={private_key}")
+    print(f"ORBIT_TASK_PUBLIC_KEY_B64={public_key}")
+    return 0
+
+
+def _add_github_store_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--github-owner", default=os.getenv("ORBIT_GITHUB_OWNER"), required=False)
+    parser.add_argument("--github-repo", default=os.getenv("ORBIT_GITHUB_REPO"), required=False)
+    parser.add_argument(
+        "--github-release-prefix",
+        default=os.getenv("ORBIT_GITHUB_RELEASE_PREFIX", "mvp-orbit"),
+    )
+    parser.add_argument("--gh-bin", default=os.getenv("ORBIT_GH_BIN", "gh"))
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="orbit", description="mvp-orbit CLI")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    package = sub.add_parser("package", help="package object commands")
+    package_sub = package.add_subparsers(dest="package_command", required=True)
+    package_upload = package_sub.add_parser("upload", help="build and upload a file package")
+    package_upload.add_argument("--source-dir", required=True)
+    package_upload.add_argument("--tmp-dir", default=None)
+    _add_github_store_args(package_upload)
+    package_upload.set_defaults(func=cmd_package_upload)
+
+    command = sub.add_parser("command", help="command object commands")
+    command_sub = command.add_subparsers(dest="command_command", required=True)
+    command_upload = command_sub.add_parser("upload", help="upload a command object from JSON")
+    command_upload.add_argument("--file", required=True)
+    _add_github_store_args(command_upload)
+    command_upload.set_defaults(func=cmd_command_upload)
+
+    task = sub.add_parser("task", help="task object commands")
+    task_sub = task.add_subparsers(dest="task_command", required=True)
+    task_upload = task_sub.add_parser("upload", help="upload a signed task object")
+    task_upload.add_argument("--file", default=None, help="optional full task JSON file")
+    task_upload.add_argument("--package-id", default=None)
+    task_upload.add_argument("--command-id", default=None)
+    task_upload.add_argument("--constraints-file", default=None)
+    task_upload.add_argument("--created-by", default=os.getenv("USER"))
+    task_upload.add_argument("--private-key", required=True)
+    task_upload.add_argument("--signer", default=None)
+    _add_github_store_args(task_upload)
+    task_upload.set_defaults(func=cmd_task_upload)
+
+    run = sub.add_parser("run", help="run commands")
+    run_sub = run.add_subparsers(dest="run_command", required=True)
+
+    run_submit = run_sub.add_parser("submit", help="submit a run to Hub")
+    run_submit.add_argument("--hub-url", required=True)
+    run_submit.add_argument("--agent-id", required=True)
+    run_submit.add_argument("--task-id", required=True)
+    run_submit.add_argument("--package-id", required=True)
+    run_submit.add_argument("--command-id", required=True)
+    run_submit.add_argument("--api-token", default=os.getenv("ORBIT_API_TOKEN"))
+    run_submit.set_defaults(func=cmd_run_submit)
+
+    run_status = run_sub.add_parser("status", help="show run status")
+    run_status.add_argument("--hub-url", required=True)
+    run_status.add_argument("--run-id", required=True)
+    run_status.add_argument("--api-token", default=os.getenv("ORBIT_API_TOKEN"))
+    run_status.set_defaults(func=cmd_run_status)
+
+    run_logs = run_sub.add_parser("logs", help="fetch logs via Hub ids + GitHub objects")
+    run_logs.add_argument("--hub-url", required=True)
+    run_logs.add_argument("--run-id", required=True)
+    run_logs.add_argument("--api-token", default=os.getenv("ORBIT_API_TOKEN"))
+    _add_github_store_args(run_logs)
+    run_logs.set_defaults(func=cmd_run_logs)
+
+    run_result = run_sub.add_parser("result", help="fetch result via Hub id + GitHub object")
+    run_result.add_argument("--hub-url", required=True)
+    run_result.add_argument("--run-id", required=True)
+    run_result.add_argument("--api-token", default=os.getenv("ORBIT_API_TOKEN"))
+    _add_github_store_args(run_result)
+    run_result.set_defaults(func=cmd_run_result)
+
+    agent = sub.add_parser("agent", help="agent commands")
+    agent_sub = agent.add_subparsers(dest="agent_command", required=True)
+    agent_run = agent_sub.add_parser("run", help="run the polling agent")
+    agent_run.set_defaults(func=cmd_agent_run)
+
+    keys = sub.add_parser("keys", help="key management commands")
+    keys_sub = keys.add_subparsers(dest="keys_command", required=True)
+    keys_generate = keys_sub.add_parser("generate", help="generate task signing keypair")
+    keys_generate.set_defaults(func=cmd_keys_generate)
+
+    hub = sub.add_parser("hub", help="hub commands")
+    hub_sub = hub.add_subparsers(dest="hub_command", required=True)
+    hub_serve = hub_sub.add_parser("serve", help="serve the Hub API")
+    hub_serve.set_defaults(func=cmd_hub_serve)
+
+    return parser
+
+
+def main(argv: list[str] | None = None) -> None:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if hasattr(args, "github_owner") and (not args.github_owner or not args.github_repo):
+        parser.error("GitHub store configuration is required for this command")
+    raise SystemExit(args.func(args))
+
+
+if __name__ == "__main__":
+    main()
