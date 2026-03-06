@@ -126,6 +126,12 @@ orbit run logs --run-id <RUN_ID>
 orbit run result --run-id <RUN_ID>
 ```
 
+### Cancel
+
+```bash
+orbit run cancel --run-id <RUN_ID>
+```
+
 Result shape:
 
 ```json
@@ -149,5 +155,5 @@ Result shape:
 5. upload task
 6. submit run
 7. poll status
-8. fetch logs/result
+8. fetch logs/result or cancel the run
 9. decide next code change

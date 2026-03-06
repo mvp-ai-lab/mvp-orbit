@@ -72,6 +72,7 @@ class RunStatus(str, Enum):
     QUEUED = "queued"
     LEASED = "leased"
     RUNNING = "running"
+    CANCELED = "canceled"
     SUCCEEDED = "succeeded"
     FAILED = "failed"
     REJECTED = "rejected"
@@ -121,6 +122,13 @@ class RunHeartbeatRequest(BaseModel):
     phase: str = Field(default="running", pattern="^(preparing|running)$")
 
 
+class RunHeartbeatResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    status: str = "accepted"
+    cancel_requested: bool = False
+
+
 class RunCompletionRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -133,7 +141,7 @@ class RunCompletionRequest(BaseModel):
     @field_validator("status")
     @classmethod
     def validate_final_status(cls, value: RunStatus) -> RunStatus:
-        if value not in {RunStatus.SUCCEEDED, RunStatus.FAILED, RunStatus.REJECTED}:
+        if value not in {RunStatus.SUCCEEDED, RunStatus.FAILED, RunStatus.REJECTED, RunStatus.CANCELED}:
             raise ValueError("completion status must be a final state")
         return value
 
@@ -150,6 +158,7 @@ class RunRecord(BaseModel):
     created_at: datetime
     leased_at: datetime | None = None
     heartbeat_at: datetime | None = None
+    cancel_requested_at: datetime | None = None
     completed_at: datetime | None = None
     log_ids: list[str] = Field(default_factory=list)
     result_id: str | None = None

@@ -32,6 +32,7 @@ class RunStore:
                     created_at TEXT NOT NULL,
                     leased_at TEXT,
                     heartbeat_at TEXT,
+                    cancel_requested_at TEXT,
                     completed_at TEXT,
                     log_ids TEXT NOT NULL DEFAULT '[]',
                     result_id TEXT,
@@ -40,6 +41,14 @@ class RunStore:
                 )
                 """
             )
+        self._ensure_column("runs", "cancel_requested_at", "TEXT")
+
+    def _ensure_column(self, table: str, column: str, ddl: str) -> None:
+        columns = {row["name"] for row in self._conn.execute(f"PRAGMA table_info({table})")}
+        if column in columns:
+            return
+        with self._conn:
+            self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
 
     def create_run(self, record: RunRecord) -> None:
         with self._lock, self._conn:
@@ -48,9 +57,9 @@ class RunStore:
                 INSERT INTO runs (
                     run_id, agent_id, task_id,
                     run_ticket, expires_at, status, created_at,
-                    leased_at, heartbeat_at, completed_at,
+                    leased_at, heartbeat_at, cancel_requested_at, completed_at,
                     log_ids, result_id, artifact_ids, failure_code
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 self._row_values(record),
             )
@@ -91,6 +100,29 @@ class RunStore:
             row = self._conn.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone()
             assert row is not None
             return self._row_to_record(dict(row))
+
+    def cancel(self, run_id: str) -> RunRecord:
+        now = utc_now()
+        with self._lock, self._conn:
+            row = self._conn.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone()
+            if row is None:
+                raise KeyError(run_id)
+            record = self._row_to_record(dict(row))
+            if record.status in {RunStatus.SUCCEEDED, RunStatus.FAILED, RunStatus.REJECTED, RunStatus.CANCELED}:
+                return record
+            if record.status == RunStatus.QUEUED:
+                self._conn.execute(
+                    "UPDATE runs SET status = ?, cancel_requested_at = ?, completed_at = ? WHERE run_id = ?",
+                    (RunStatus.CANCELED.value, now.isoformat(), now.isoformat(), run_id),
+                )
+            else:
+                self._conn.execute(
+                    "UPDATE runs SET cancel_requested_at = ? WHERE run_id = ?",
+                    (now.isoformat(), run_id),
+                )
+            updated = self._conn.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone()
+            assert updated is not None
+            return self._row_to_record(dict(updated))
 
     def complete(self, run_id: str, completion: RunCompletionRequest) -> RunRecord:
         completed_at = utc_now()
@@ -136,6 +168,7 @@ class RunStore:
             record.created_at.isoformat(),
             record.leased_at.isoformat() if record.leased_at else None,
             record.heartbeat_at.isoformat() if record.heartbeat_at else None,
+            record.cancel_requested_at.isoformat() if record.cancel_requested_at else None,
             record.completed_at.isoformat() if record.completed_at else None,
             json.dumps(record.log_ids),
             record.result_id,
@@ -155,6 +188,7 @@ class RunStore:
             created_at=_parse_dt(row["created_at"]),
             leased_at=_parse_dt(row["leased_at"]),
             heartbeat_at=_parse_dt(row["heartbeat_at"]),
+            cancel_requested_at=_parse_dt(row.get("cancel_requested_at")),
             completed_at=_parse_dt(row["completed_at"]),
             log_ids=json.loads(row["log_ids"] or "[]"),
             result_id=row["result_id"],

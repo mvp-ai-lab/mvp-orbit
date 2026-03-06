@@ -251,7 +251,7 @@ orbit run submit \
 - `run_id`
 - `run_ticket`
 
-#### 5) 查询状态、日志和结果
+#### 5) 查询状态、日志、结果或取消任务
 
 ```bash
 orbit run status --run-id <RUN_ID>
@@ -260,5 +260,8 @@ orbit run logs \
   --run-id <RUN_ID>
 
 orbit run result \
+  --run-id <RUN_ID>
+
+orbit run cancel \
   --run-id <RUN_ID>
 ```

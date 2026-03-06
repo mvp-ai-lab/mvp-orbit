@@ -235,6 +235,14 @@ def cmd_run_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_run_cancel(args: argparse.Namespace) -> int:
+    with httpx.Client(timeout=20) as client:
+        response = client.post(f"{args.hub_url}/api/runs/{args.run_id}/cancel", headers=_headers(args.api_token))
+        response.raise_for_status()
+        print(json.dumps(response.json(), ensure_ascii=False, indent=2))
+    return 0
+
+
 def cmd_run_logs(args: argparse.Namespace) -> int:
     with httpx.Client(timeout=20) as client:
         response = client.get(f"{args.hub_url}/api/runs/{args.run_id}", headers=_headers(args.api_token))
@@ -352,6 +360,12 @@ def build_parser() -> argparse.ArgumentParser:
     run_status.add_argument("--api-token", default=os.getenv("ORBIT_API_TOKEN"))
     run_status.set_defaults(func=cmd_run_status)
 
+    run_cancel = run_sub.add_parser("cancel", help="cancel a queued or running run")
+    run_cancel.add_argument("--hub-url", default=None)
+    run_cancel.add_argument("--run-id", required=True)
+    run_cancel.add_argument("--api-token", default=os.getenv("ORBIT_API_TOKEN"))
+    run_cancel.set_defaults(func=cmd_run_cancel)
+
     run_logs = run_sub.add_parser("logs", help="fetch logs via Hub ids + GitHub objects")
     run_logs.add_argument("--hub-url", default=None)
     run_logs.add_argument("--run-id", required=True)
@@ -402,7 +416,7 @@ def prepare_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> a
     if args.command == "task" and args.task_command == "upload":
         _validate_required(parser, args, "private_key")
 
-    if args.command == "run" and args.run_command in {"submit", "status", "logs", "result"}:
+    if args.command == "run" and args.run_command in {"submit", "status", "cancel", "logs", "result"}:
         _validate_required(parser, args, "hub_url")
     if args.command == "run" and args.run_command == "submit":
         _validate_required(parser, args, "agent_id")

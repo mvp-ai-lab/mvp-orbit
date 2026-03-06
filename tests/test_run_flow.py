@@ -251,3 +251,100 @@ def test_api_unavailable_does_not_execute(tmp_path):
     )
     service = AgentService(agent_id="agent-a", hub_url="http://127.0.0.1:9", runtime=runtime, poll_interval_sec=0.01)
     assert service.poll_once() == "poll_error"
+
+
+def test_queued_run_can_be_canceled(tmp_path):
+    app = create_app(
+        run_store=RunStore(tmp_path / "runs.sqlite3"),
+        ticket_manager=RunTicketManager("q" * 32),
+        api_token="api-token",
+    )
+    client = TestClient(app)
+    submit = client.post(
+        "/api/runs",
+        json=RunCreateRequest(agent_id="agent-a", task_id="sha256-" + ("1" * 64)).model_dump(mode="json"),
+        headers={"Authorization": "Bearer api-token"},
+    )
+    run_id = submit.json()["run_id"]
+
+    cancel = client.post(f"/api/runs/{run_id}/cancel", headers={"Authorization": "Bearer api-token"})
+    assert cancel.status_code == 200
+    assert cancel.json()["status"] == "canceled"
+
+    status_resp = client.get(f"/api/runs/{run_id}", headers={"Authorization": "Bearer api-token"})
+    assert status_resp.status_code == 200
+    assert status_resp.json()["status"] == "canceled"
+
+
+def test_running_run_can_be_canceled(tmp_path):
+    store = _build_store()
+    private_key, public_key = generate_keypair_b64()
+
+    source_dir = tmp_path / "src"
+    source_dir.mkdir()
+    (source_dir / "payload.txt").write_text("safe", encoding="utf-8")
+    package_build = build_file_package(source_dir)
+    package_id = store.put_package(package_build.archive_path.read_bytes())
+    command_id = store.put_command(
+        CommandObject(argv=[sys.executable, "-c", "import time; time.sleep(30)"], working_dir=".")
+    )
+    signed_task = _signed_task(package_id, command_id, private_key)
+    task_id = store.put_signed_task(signed_task)
+
+    app = create_app(
+        run_store=RunStore(tmp_path / "runs.sqlite3"),
+        ticket_manager=RunTicketManager("z" * 32),
+        api_token="api-token",
+    )
+    client = TestClient(app)
+    submit = client.post(
+        "/api/runs",
+        json=RunCreateRequest(agent_id="agent-a", task_id=task_id).model_dump(mode="json"),
+        headers={"Authorization": "Bearer api-token"},
+    )
+    run_id = submit.json()["run_id"]
+    lease_payload = client.get("/api/agents/agent-a/next", headers={"Authorization": "Bearer api-token"}).json()
+
+    runtime = AgentRuntime(
+        agent_id="agent-a",
+        ticket_manager=RunTicketManager("z" * 32),
+        replay_guard=ReplayGuard(),
+        object_store=store,
+        verify_public_key_b64=public_key,
+        workspace_root=tmp_path / "workspaces",
+        heartbeat_interval_sec=0.01,
+    )
+    lease = RunLease.model_validate(lease_payload)
+
+    phases: list[str] = []
+
+    def heartbeat(phase: str) -> bool:
+        phases.append(phase)
+        if phase == "running":
+            client.post(f"/api/runs/{run_id}/cancel", headers={"Authorization": "Bearer api-token"})
+        response = client.post(
+            f"/api/runs/{run_id}/heartbeat",
+            json={"phase": phase},
+            headers={"Authorization": "Bearer api-token"},
+        )
+        return response.json()["cancel_requested"]
+
+    outcome = runtime.handle_run(lease, heartbeat=heartbeat)
+    complete = client.post(
+        f"/api/runs/{run_id}/complete",
+        json=RunCompletionRequest(
+            status=outcome.status,
+            log_ids=outcome.log_ids,
+            result_id=outcome.result_id,
+            artifact_ids=outcome.artifact_ids,
+            failure_code=outcome.failure_code,
+        ).model_dump(mode="json"),
+        headers={"Authorization": "Bearer api-token"},
+    )
+    assert complete.status_code == 200
+    assert outcome.status.value == "canceled"
+    assert "running" in phases
+
+    record = client.get(f"/api/runs/{run_id}", headers={"Authorization": "Bearer api-token"}).json()
+    assert record["status"] == "canceled"
+    assert record["failure_code"] == "canceled"

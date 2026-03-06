@@ -27,6 +27,10 @@ class ExecutionOutcome:
     failure_code: str | None = None
 
 
+class CanceledRunError(Exception):
+    pass
+
+
 class AgentRuntime:
     def __init__(
         self,
@@ -52,9 +56,30 @@ class AgentRuntime:
         try:
             package_id, command = self._validate_and_load_objects(lease)
             if heartbeat is not None:
-                heartbeat("preparing")
+                if heartbeat("preparing"):
+                    raise CanceledRunError("run canceled before execution")
             workspace = self._prepare_workspace(lease.run_id, package_id)
             return self._execute_command(lease, command, workspace, heartbeat)
+        except CanceledRunError as exc:
+            now = datetime.now(timezone.utc)
+            stderr_log_id = self.object_store.put_log(
+                LogObject(stream="stderr", data=str(exc), captured_at=now)
+            )
+            result_id = self.object_store.put_result(
+                ResultObject(
+                    status=RunStatus.CANCELED.value,
+                    exit_code=-15,
+                    started_at=now,
+                    finished_at=now,
+                )
+            )
+            return ExecutionOutcome(
+                status=RunStatus.CANCELED,
+                log_ids=[stderr_log_id],
+                result_id=result_id,
+                artifact_ids=[],
+                failure_code="canceled",
+            )
         except Exception as exc:
             now = datetime.now(timezone.utc)
             stderr_log_id = self.object_store.put_log(
@@ -130,7 +155,7 @@ class AgentRuntime:
         lease: RunLease,
         command,
         workspace: Path,
-        heartbeat: Callable[[str], None] | None,
+        heartbeat: Callable[[str], bool] | None,
     ) -> ExecutionOutcome:
         started_at = datetime.now(timezone.utc)
         stdout_path = Path(tempfile.mkstemp(prefix="orbit-stdout-", dir=workspace)[1])
@@ -156,16 +181,23 @@ class AgentRuntime:
                 next_heartbeat = time.monotonic()
                 deadline = time.monotonic() + command.timeout_sec
                 timed_out = False
+                canceled = False
                 while True:
                     if heartbeat is not None and time.monotonic() >= next_heartbeat:
-                        heartbeat("running")
+                        if heartbeat("running"):
+                            return_code = self._terminate_process(proc)
+                            timed_out = False
+                            canceled = True
+                            break
                         next_heartbeat = time.monotonic() + self.heartbeat_interval_sec
 
                     return_code = proc.poll()
                     if return_code is not None:
+                        canceled = False
                         break
                     if time.monotonic() >= deadline:
                         timed_out = True
+                        canceled = False
                         proc.kill()
                         proc.wait()
                         return_code = -1
@@ -190,8 +222,11 @@ class AgentRuntime:
                     )
                 )
 
-            status = RunStatus.SUCCEEDED if return_code == 0 and not timed_out else RunStatus.FAILED
+            status = RunStatus.SUCCEEDED if return_code == 0 and not timed_out and not canceled else RunStatus.FAILED
             failure_code = "timeout" if timed_out else None
+            if canceled:
+                status = RunStatus.CANCELED
+                failure_code = "canceled"
             result_id = self.object_store.put_result(
                 ResultObject(
                     status=status.value,
@@ -210,6 +245,19 @@ class AgentRuntime:
         finally:
             stdout_path.unlink(missing_ok=True)
             stderr_path.unlink(missing_ok=True)
+
+    @staticmethod
+    def _terminate_process(proc: subprocess.Popen[str], grace_sec: float = 10.0) -> int:
+        proc.terminate()
+        deadline = time.monotonic() + grace_sec
+        while time.monotonic() < deadline:
+            return_code = proc.poll()
+            if return_code is not None:
+                return return_code
+            time.sleep(0.2)
+        proc.kill()
+        proc.wait()
+        return proc.returncode if proc.returncode is not None else -9
 
     @staticmethod
     def _extract_safely(tar: tarfile.TarFile, destination: Path) -> None:

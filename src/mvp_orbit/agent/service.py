@@ -6,7 +6,7 @@ from dataclasses import dataclass
 import httpx
 
 from mvp_orbit.agent.runtime import AgentRuntime
-from mvp_orbit.core.models import RunCompletionRequest, RunHeartbeatRequest, RunLease
+from mvp_orbit.core.models import RunCompletionRequest, RunHeartbeatRequest, RunHeartbeatResponse, RunLease
 
 
 @dataclass
@@ -52,7 +52,7 @@ class AgentService:
                 self.poll_once(client=client)
                 time.sleep(self.poll_interval_sec)
 
-    def _heartbeat(self, client: httpx.Client, run_id: str, phase: str) -> None:
+    def _heartbeat(self, client: httpx.Client, run_id: str, phase: str) -> bool:
         request = RunHeartbeatRequest(phase=phase)
         response = client.post(
             f"{self.hub_url}/api/runs/{run_id}/heartbeat",
@@ -60,6 +60,8 @@ class AgentService:
             json=request.model_dump(mode="json"),
         )
         response.raise_for_status()
+        payload = RunHeartbeatResponse.model_validate(response.json())
+        return payload.cancel_requested
 
     def _complete(self, client: httpx.Client, run_id: str, outcome) -> None:
         request = RunCompletionRequest(

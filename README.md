@@ -252,7 +252,7 @@ Output:
 - `run_id`
 - `run_ticket`
 
-#### 5) Query status, logs, and result
+#### 5) Query status, logs, result, or cancel
 
 ```bash
 orbit run status --run-id <RUN_ID>
@@ -261,5 +261,8 @@ orbit run logs \
   --run-id <RUN_ID>
 
 orbit run result \
+  --run-id <RUN_ID>
+
+orbit run cancel \
   --run-id <RUN_ID>
 ```

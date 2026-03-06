@@ -11,6 +11,7 @@ from mvp_orbit.core.models import (
     RunCreateRequest,
     RunCreateResponse,
     RunHeartbeatRequest,
+    RunHeartbeatResponse,
     RunRecord,
     RunStatus,
     default_run_id,
@@ -95,13 +96,21 @@ def create_app(
             return Response(status_code=status.HTTP_204_NO_CONTENT)
         return record.model_dump(mode="json", include={"run_id", "agent_id", "task_id", "run_ticket", "expires_at"})
 
-    @app.post("/api/runs/{run_id}/heartbeat", dependencies=[Depends(require_auth)])
-    def heartbeat(run_id: str, heartbeat_request: RunHeartbeatRequest) -> dict[str, str]:
+    @app.post("/api/runs/{run_id}/heartbeat", dependencies=[Depends(require_auth)], response_model=RunHeartbeatResponse)
+    def heartbeat(run_id: str, heartbeat_request: RunHeartbeatRequest) -> RunHeartbeatResponse:
         try:
-            run_store.heartbeat(run_id, phase=heartbeat_request.phase)
+            record = run_store.heartbeat(run_id, phase=heartbeat_request.phase)
         except KeyError as exc:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="run not found") from exc
-        return {"status": "accepted"}
+        return RunHeartbeatResponse(cancel_requested=record.cancel_requested_at is not None)
+
+    @app.post("/api/runs/{run_id}/cancel", dependencies=[Depends(require_auth)])
+    def cancel(run_id: str) -> dict[str, str]:
+        try:
+            record = run_store.cancel(run_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="run not found") from exc
+        return {"status": record.status.value}
 
     @app.post("/api/runs/{run_id}/complete", dependencies=[Depends(require_auth)])
     def complete(run_id: str, completion: RunCompletionRequest) -> dict[str, str]:

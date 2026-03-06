@@ -12,6 +12,7 @@ Use `mvp-orbit` as a small remote execution loop:
 3. create a task from `package_id + command_id`
 4. submit the task to a target `agent_id`
 5. read run status, logs, and result
+6. cancel the run if it should stop early
 
 ## Workflow
 
@@ -43,8 +44,9 @@ Always parse the JSON output of each CLI command and feed the returned IDs into 
 - Use `orbit run status --run-id <run_id>` for current state.
 - Use `orbit run logs --run-id <run_id>` to fetch collected stdout/stderr.
 - Use `orbit run result --run-id <run_id>` to fetch the final result object.
+- Use `orbit run cancel --run-id <run_id>` to stop a queued or running task.
 - Treat `queued` and `running` as non-terminal.
-- Treat `succeeded`, `failed`, and `rejected` as terminal.
+- Treat `succeeded`, `failed`, `rejected`, and `canceled` as terminal.
 
 ## Working rules
 
