@@ -215,7 +215,13 @@ class GitHubGhCliBackend:
         if result.returncode == 0:
             return release_tag
 
-        self._run_gh(
+        stderr = (result.stderr or "").strip()
+        stdout = (result.stdout or "").strip()
+        if not self._is_release_missing(stderr, stdout):
+            message = stderr or stdout or f"failed to inspect release {release_tag}"
+            raise RuntimeError(f"gh command failed: {message}")
+
+        create_result = self._run_gh(
             [
                 "release",
                 "create",
@@ -226,8 +232,19 @@ class GitHubGhCliBackend:
                 release_tag,
                 "--notes",
                 "",
-            ]
+            ],
+            check=False,
         )
+        if create_result.returncode == 0:
+            return release_tag
+
+        create_stderr = (create_result.stderr or "").strip()
+        create_stdout = (create_result.stdout or "").strip()
+        if self._is_release_already_exists(create_stderr, create_stdout):
+            return release_tag
+
+        message = create_stderr or create_stdout or f"failed to create release {release_tag}"
+        raise RuntimeError(f"gh command failed: {message}")
         return release_tag
 
     def _get_asset(self, namespace: ObjectNamespace, object_id: str, filename: str) -> dict:
@@ -253,6 +270,16 @@ class GitHubGhCliBackend:
 
     def _release_tag(self, namespace: ObjectNamespace) -> str:
         return f"{self.release_prefix}-{namespace.value}"
+
+    @staticmethod
+    def _is_release_missing(stderr: str, stdout: str) -> bool:
+        text = f"{stderr}\n{stdout}".lower()
+        return "release not found" in text or "not found" in text
+
+    @staticmethod
+    def _is_release_already_exists(stderr: str, stdout: str) -> bool:
+        text = f"{stderr}\n{stdout}".lower()
+        return "already exists" in text
 
     def _run_gh(self, args: list[str], *, check: bool = True) -> subprocess.CompletedProcess[str]:
         result = subprocess.run(
