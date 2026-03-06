@@ -13,6 +13,12 @@ from mvp_orbit.core.signing import generate_keypair_b64
 DEFAULT_CONFIG_PATH = Path("~/.config/mvp-orbit/config.toml").expanduser()
 
 
+class StorageConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    provider: str = "github"
+
+
 class GitHubConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -20,6 +26,17 @@ class GitHubConfig(BaseModel):
     repo: str | None = None
     release_prefix: str = "mvp-orbit"
     gh_bin: str = "gh"
+
+
+class HuggingFaceConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    repo_id: str | None = None
+    repo_type: str = "dataset"
+    path_prefix: str = "mvp-orbit"
+    hf_bin: str = "hf"
+    private: bool = True
+    token: str | None = None
 
 
 class HubConfig(BaseModel):
@@ -60,7 +77,9 @@ class AgentConfig(BaseModel):
 class OrbitConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    storage: StorageConfig = Field(default_factory=StorageConfig)
     github: GitHubConfig = Field(default_factory=GitHubConfig)
+    huggingface: HuggingFaceConfig = Field(default_factory=HuggingFaceConfig)
     hub: HubConfig = Field(default_factory=HubConfig)
     auth: AuthConfig = Field(default_factory=AuthConfig)
     task_signing: TaskSigningConfig = Field(default_factory=TaskSigningConfig)
@@ -113,7 +132,9 @@ def render_config(config: OrbitConfig) -> str:
         "",
     ]
     sections = [
+        ("storage", config.storage.model_dump(mode="json", exclude_none=True)),
         ("github", config.github.model_dump(mode="json", exclude_none=True)),
+        ("huggingface", config.huggingface.model_dump(mode="json", exclude_none=True)),
         ("hub", config.hub.model_dump(mode="json", exclude_none=True)),
         ("auth", config.auth.model_dump(mode="json", exclude_none=True)),
         ("task_signing", config.task_signing.model_dump(mode="json", exclude_none=True)),

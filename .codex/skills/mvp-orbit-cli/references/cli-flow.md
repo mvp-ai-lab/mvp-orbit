@@ -124,6 +124,8 @@ orbit run logs --run-id <RUN_ID> --follow
 
 Notes:
 
+- Prefer `--follow` when monitoring an active run.
+- Use the non-follow form when you want a point-in-time snapshot or to re-fetch the collected logs after completion.
 - `--follow` prints incremental stdout/stderr as chunks arrive.
 - The Agent uploads a chunk every 10 seconds by default, or earlier when buffered output exceeds 16 KiB.
 
@@ -172,6 +174,6 @@ Result shape:
 4. upload command
 5. upload task
 6. submit run
-7. poll status
-8. fetch logs/result or cancel the run
+7. follow logs while the run is active
+8. fetch final status/result or cancel the run
 9. decide next code change

@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
+from mvp_orbit.config import OrbitConfig
 from mvp_orbit.core.canonical import canonical_json_bytes, object_id_for_bytes, object_id_for_json, validate_object_id
 from mvp_orbit.core.models import CommandObject, LogObject, ObjectNamespace, ResultObject, SignedTaskObject
 
@@ -313,3 +314,193 @@ class GitHubGhCliBackend:
             stderr = result.stderr.strip() or result.stdout.strip() or "unknown gh error"
             raise RuntimeError(f"gh command failed: {stderr}")
         return result
+
+
+class HuggingFaceCliBackend:
+    def __init__(
+        self,
+        repo_id: str,
+        *,
+        repo_type: str = "dataset",
+        path_prefix: str = "mvp-orbit",
+        hf_bin: str = "hf",
+        private: bool = True,
+        token: str | None = None,
+    ) -> None:
+        self.repo_id = repo_id
+        self.repo_type = repo_type
+        self.path_prefix = path_prefix.strip("/")
+        self.hf_bin = hf_bin
+        self.private = private
+        self.token = token
+        if shutil.which(self.hf_bin) is None:
+            raise RuntimeError(f"Hugging Face CLI not found: {self.hf_bin}")
+
+    def put_bytes(
+        self,
+        namespace: ObjectNamespace,
+        object_id: str,
+        payload: bytes,
+        *,
+        content_type: str,
+        filename: str,
+    ) -> StoredObjectMeta:
+        del content_type
+        remote_path = self._path(namespace, filename)
+        tmp_dir = Path(tempfile.mkdtemp(prefix="orbit-hf-upload-"))
+        try:
+            tmp_file = tmp_dir / filename
+            tmp_file.write_bytes(payload)
+            args = ["upload", "--repo-type", self.repo_type]
+            if self.private:
+                args.append("--private")
+            if self.token:
+                args.extend(["--token", self.token])
+            args.extend(
+                [
+                    self.repo_id,
+                    str(tmp_file),
+                    remote_path,
+                ]
+            )
+            self._run_hf(args)
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+        return StoredObjectMeta(
+            namespace=namespace,
+            object_id=object_id,
+            size=len(payload),
+            storage_ref=f"hf:{self.repo_id}/{remote_path}",
+        )
+
+    def get_bytes(self, namespace: ObjectNamespace, object_id: str, *, filename: str) -> bytes:
+        remote_path = self._path(namespace, filename)
+        tmp_dir = Path(tempfile.mkdtemp(prefix="orbit-hf-download-"))
+        try:
+            result = self._run_hf(
+                [
+                    "download",
+                    "--repo-type",
+                    self.repo_type,
+                    "--local-dir",
+                    str(tmp_dir),
+                    *self._token_args(),
+                    self.repo_id,
+                    remote_path,
+                ],
+                check=False,
+            )
+            if result.returncode != 0:
+                message = (result.stderr or "").strip() or (result.stdout or "").strip() or "unknown hf error"
+                if self._is_missing(message):
+                    raise FileNotFoundError(f"{namespace.value}:{object_id}")
+                raise RuntimeError(f"hf command failed: {message}")
+            file_path = tmp_dir / remote_path
+            if not file_path.exists():
+                raise FileNotFoundError(f"{namespace.value}:{object_id}")
+            return file_path.read_bytes()
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    def exists(self, namespace: ObjectNamespace, object_id: str, *, filename: str) -> bool:
+        try:
+            self.get_bytes(namespace, object_id, filename=filename)
+        except FileNotFoundError:
+            return False
+        return True
+
+    def get_meta(self, namespace: ObjectNamespace, object_id: str, *, filename: str) -> StoredObjectMeta:
+        payload = self.get_bytes(namespace, object_id, filename=filename)
+        return StoredObjectMeta(
+            namespace=namespace,
+            object_id=object_id,
+            size=len(payload),
+            storage_ref=f"hf:{self.repo_id}/{self._path(namespace, filename)}",
+        )
+
+    def purge_managed_paths(self) -> list[str]:
+        deleted: list[str] = []
+        for namespace in ObjectNamespace:
+            pattern = self._delete_pattern(namespace)
+            result = self._run_hf(
+                [
+                    "repo-files",
+                    "delete",
+                    "--repo-type",
+                    self.repo_type,
+                    "--commit-message",
+                    f"Delete {pattern}",
+                    *self._token_args(),
+                    self.repo_id,
+                    pattern,
+                ],
+                check=False,
+            )
+            if result.returncode != 0:
+                message = (result.stderr or "").strip() or (result.stdout or "").strip() or "unknown hf error"
+                if self._is_missing(message):
+                    continue
+                raise RuntimeError(f"hf command failed: {message}")
+            deleted.append(pattern)
+        return deleted
+
+    def _path(self, namespace: ObjectNamespace, filename: str) -> str:
+        parts = [namespace.value, filename]
+        if self.path_prefix:
+            parts.insert(0, self.path_prefix)
+        return "/".join(parts)
+
+    def _delete_pattern(self, namespace: ObjectNamespace) -> str:
+        parts = [namespace.value, "*"]
+        if self.path_prefix:
+            parts.insert(0, self.path_prefix)
+        return "/".join(parts)
+
+    def _token_args(self) -> list[str]:
+        if not self.token:
+            return []
+        return ["--token", self.token]
+
+    @staticmethod
+    def _is_missing(message: str) -> bool:
+        text = message.lower()
+        return (
+            "404" in text
+            or "not found" in text
+            or "entry not found" in text
+            or "cannot find" in text
+        )
+
+    def _run_hf(self, args: list[str], *, check: bool = True) -> subprocess.CompletedProcess[str]:
+        result = subprocess.run(
+            [self.hf_bin, *args],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if check and result.returncode != 0:
+            stderr = result.stderr.strip() or result.stdout.strip() or "unknown hf error"
+            raise RuntimeError(f"hf command failed: {stderr}")
+        return result
+
+
+def build_backend_from_config(config: OrbitConfig, args) -> ObjectStoreBackend:
+    provider = getattr(args, "store_provider", None) or config.storage.provider
+    if provider == "github":
+        return GitHubGhCliBackend(
+            owner=args.github_owner,
+            repo=args.github_repo,
+            release_prefix=args.github_release_prefix,
+            gh_bin=args.gh_bin,
+        )
+    if provider == "huggingface":
+        return HuggingFaceCliBackend(
+            repo_id=args.hf_repo_id,
+            repo_type=args.hf_repo_type,
+            path_prefix=args.hf_path_prefix,
+            hf_bin=args.hf_bin,
+            private=args.hf_private,
+            token=args.hf_token,
+        )
+    raise RuntimeError(f"unsupported object store provider: {provider}")

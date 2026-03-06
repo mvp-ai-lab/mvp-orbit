@@ -5,7 +5,7 @@ import os
 from mvp_orbit.agent.runtime import AgentRuntime
 from mvp_orbit.agent.service import AgentService
 from mvp_orbit.core.tickets import ReplayGuard, RunTicketManager
-from mvp_orbit.integrations.object_store import GitHubGhCliBackend, ObjectStore
+from mvp_orbit.integrations.object_store import GitHubGhCliBackend, HuggingFaceCliBackend, ObjectStore
 
 
 def _required(name: str, default: str | None = None) -> str:
@@ -16,12 +16,25 @@ def _required(name: str, default: str | None = None) -> str:
 
 
 def build_object_store() -> ObjectStore:
-    backend = GitHubGhCliBackend(
-        owner=_required("ORBIT_GITHUB_OWNER"),
-        repo=_required("ORBIT_GITHUB_REPO"),
-        release_prefix=os.getenv("ORBIT_GITHUB_RELEASE_PREFIX", "mvp-orbit"),
-        gh_bin=os.getenv("ORBIT_GH_BIN", "gh"),
-    )
+    provider = os.getenv("ORBIT_STORE_PROVIDER", "github")
+    if provider == "github":
+        backend = GitHubGhCliBackend(
+            owner=_required("ORBIT_GITHUB_OWNER"),
+            repo=_required("ORBIT_GITHUB_REPO"),
+            release_prefix=os.getenv("ORBIT_GITHUB_RELEASE_PREFIX", "mvp-orbit"),
+            gh_bin=os.getenv("ORBIT_GH_BIN", "gh"),
+        )
+    elif provider == "huggingface":
+        backend = HuggingFaceCliBackend(
+            repo_id=_required("ORBIT_HF_REPO_ID"),
+            repo_type=os.getenv("ORBIT_HF_REPO_TYPE", "dataset"),
+            path_prefix=os.getenv("ORBIT_HF_PATH_PREFIX", "mvp-orbit"),
+            hf_bin=os.getenv("ORBIT_HF_BIN", "hf"),
+            private=os.getenv("ORBIT_HF_PRIVATE", "true").lower() not in {"0", "false", "no"},
+            token=os.getenv("ORBIT_HF_TOKEN"),
+        )
+    else:
+        raise RuntimeError(f"unsupported object store provider: {provider}")
     return ObjectStore(backend)
 
 

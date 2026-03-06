@@ -79,19 +79,18 @@
 
 - Hub 负责保存运行元数据和对象 ID
 - Agent 轮询 Hub 获取任务
-- 真实任务内容存放在 GitHub Release Assets
+- 真实任务内容存放在 relay 对象存储中
 - 开发机和 Agent 机都使用同一个 `orbit` CLI
 - 初始化之后默认使用同一份 TOML 配置
 
 ## 当前后端
 
-当前版本只实现了 GitHub 存储后端。
+当前版本支持两种对象存储后端：
 
-- GitHub 操作通过 `gh` CLI 完成
-- 机器上需要先执行过 `gh auth login`
-- 对象统一存放在独立 relay 仓库的 GitHub Release Assets 中
+- GitHub relay 存储，通过 `gh release ...`
+- Hugging Face relay 存储，通过 `hf upload` / `hf download`
 
-存储层通过 `ObjectStoreBackend` 抽象，后续扩展到 S3、Hugging Face 等后端时，不需要改执行链路。
+存储层通过 `ObjectStoreBackend` 抽象，后续扩展到 S3 等后端时，不需要改执行链路。
 
 ## 快速开始
 
@@ -106,9 +105,9 @@
 ### 必需配置
 
 - Python 3.11+
-- GitHub CLI (`gh`)
-- 一个私有 GitHub relay 仓库
-- Hub/开发机与 Agent 机器上都已经完成 `gh auth login`
+- 二选一：GitHub CLI (`gh`) + relay 仓库，或 Hugging Face CLI (`hf`) + relay 仓库
+- 如果使用 GitHub 存储：Hub/开发机与 Agent 机器上都已经完成 `gh auth login`
+- 如果使用 Hugging Face 存储：Hub/开发机与 Agent 机器上都已经完成 `hf auth login`
 - 如需代理，可设置 `HTTPS_PROXY`
 
 #### 1) 交互式初始化 Hub 配置
@@ -121,7 +120,8 @@ orbit init hub
 
 该命令会交互式询问：
 
-- GitHub relay 仓库配置
+- 存储后端类型
+- 对应后端的 relay 配置
 - Hub 监听 host / port / sqlite 路径
 - Hub 对外 URL
 
@@ -152,7 +152,8 @@ orbit init agent --agent-id agent-a
 - Hub `api_token`
 - 共享的 `ticket_secret`
 - task 公钥
-- GitHub relay 仓库配置
+- 存储后端类型
+- 对应后端的 relay 配置
 
 然后启动 Agent：
 
@@ -281,4 +282,5 @@ Agent 默认每 10 秒上传一次日志分片；如果缓冲输出超过 16 KiB
 orbit relay clean --yes
 ```
 
-这个命令会删除当前 `release_prefix-*` 命名空间下的 managed releases。
+如果使用 GitHub 存储，这个命令会删除当前 `release_prefix-*` 命名空间下的 managed releases。
+如果使用 Hugging Face 存储，这个命令会删除当前 `path_prefix/<namespace>/*` 下的 managed files。

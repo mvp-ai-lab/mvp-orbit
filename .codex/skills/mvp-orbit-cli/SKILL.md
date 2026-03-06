@@ -42,8 +42,8 @@ Always parse the JSON output of each CLI command and feed the returned IDs into 
 ### 4) Inspect execution through run APIs
 
 - Use `orbit run status --run-id <run_id>` for current state.
-- Use `orbit run logs --run-id <run_id>` to fetch collected stdout/stderr.
-- Use `orbit run logs --run-id <run_id> --follow` when the user wants live log output while a task is running.
+- Prefer `orbit run logs --run-id <run_id> --follow` when monitoring an active run.
+- Use `orbit run logs --run-id <run_id>` to fetch collected stdout/stderr when you need a point-in-time snapshot or after the run reaches a terminal state.
 - Use `orbit run result --run-id <run_id>` to fetch the final result object.
 - Use `orbit run cancel --run-id <run_id>` to stop a queued or running task.
 - Use `orbit relay clean --yes` only when the user explicitly wants to remove all mvp-orbit managed content from the relay repository.
@@ -58,6 +58,7 @@ Always parse the JSON output of each CLI command and feed the returned IDs into 
 - Build command objects as structured JSON with `argv` rather than shell strings when possible.
 - Keep `working_dir` relative to the package root.
 - Use a temporary `command.json` file when you need to synthesize a one-off command.
+- Prefer a streaming-log workflow for active runs: submit, follow logs, then fetch final status/result when the run terminates.
 - When reporting results back to the user, include `run_id`, final status, exit code, and the important log lines.
 
 ## References

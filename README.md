@@ -80,19 +80,18 @@ This keeps the workflow simple:
 
 - Hub stores run metadata and object IDs
 - Agent polls the Hub for work
-- real task content is stored in GitHub Release Assets
+- real task content is stored in a relay object store
 - both the developer side and the agent side use the same `orbit` CLI
 - configuration is kept in a default TOML file after initialization
 
 ## Current backend
 
-The current version is GitHub-only for object storage.
+The current version supports two object-store backends:
 
-- GitHub access is performed through `gh` CLI
-- the machine is expected to have completed `gh auth login`
-- objects are stored in a dedicated relay repository through GitHub Release Assets
+- GitHub relay storage through `gh release ...`
+- Hugging Face relay storage through `hf upload` / `hf download`
 
-Storage is abstracted behind `ObjectStoreBackend`, so later backends like S3 or Hugging Face can be added without changing the run flow.
+Storage is abstracted behind `ObjectStoreBackend`, so later backends like S3 can be added without changing the run flow.
 
 ## Quick start
 
@@ -107,9 +106,9 @@ You can override that path with `--config /path/to/config.toml` or `ORBIT_CONFIG
 ### Required setup
 
 - Python 3.11+
-- GitHub CLI (`gh`)
-- A private GitHub relay repository
-- `gh auth login` already completed on both the Hub/developer machine and the Agent machine
+- Either GitHub CLI (`gh`) with a relay repo, or Hugging Face CLI (`hf`) with a relay repo
+- For GitHub storage: `gh auth login` already completed on both the Hub/developer machine and the Agent machine
+- For Hugging Face storage: `hf auth login` already completed on both the Hub/developer machine and the Agent machine
 - Optional proxy via `HTTPS_PROXY`
 
 #### 1) Initialize Hub config interactively
@@ -122,7 +121,8 @@ orbit init hub
 
 The command prompts for:
 
-- GitHub relay repo settings
+- storage provider
+- provider-specific relay settings
 - Hub bind host / port / sqlite path
 - Hub public URL
 
@@ -153,7 +153,8 @@ The command prompts for:
 - Hub `api_token`
 - shared `ticket_secret`
 - task signing public key
-- GitHub relay repo settings
+- storage provider
+- provider-specific relay settings
 
 Then start the Agent:
 
@@ -282,4 +283,5 @@ If you want to remove all `mvp-orbit` managed content from the relay repository 
 orbit relay clean --yes
 ```
 
-This deletes the managed releases under the current `release_prefix-*` namespace.
+For GitHub storage, this deletes the managed releases under the current `release_prefix-*` namespace.
+For Hugging Face storage, this deletes the managed files under the current `path_prefix/<namespace>/*` namespace.

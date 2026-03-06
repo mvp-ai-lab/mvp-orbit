@@ -15,7 +15,12 @@ from mvp_orbit.config import OrbitConfig, ensure_hub_secrets, load_config, save_
 from mvp_orbit.core.canonical import object_id_for_json
 from mvp_orbit.core.models import CommandObject, RunCreateRequest, RunStatus, SignedTaskObject, TaskObject, utc_now
 from mvp_orbit.core.signing import generate_keypair_b64, sign_payload
-from mvp_orbit.integrations.object_store import GitHubGhCliBackend, ObjectStore
+from mvp_orbit.integrations.object_store import (
+    GitHubGhCliBackend,
+    HuggingFaceCliBackend,
+    ObjectStore,
+    build_backend_from_config,
+)
 
 
 def _read_private_key(value: str) -> str:
@@ -46,19 +51,33 @@ def _set_env_if_missing(name: str, value: str | None) -> None:
 
 
 def _apply_config_defaults(args: argparse.Namespace, config: OrbitConfig) -> None:
+    _set_if_missing(args, "store_provider", config.storage.provider)
     _set_if_missing(args, "github_owner", config.github.owner)
     _set_if_missing(args, "github_repo", config.github.repo)
     _set_if_missing(args, "github_release_prefix", config.github.release_prefix)
     _set_if_missing(args, "gh_bin", config.github.gh_bin)
+    _set_if_missing(args, "hf_repo_id", config.huggingface.repo_id)
+    _set_if_missing(args, "hf_repo_type", config.huggingface.repo_type)
+    _set_if_missing(args, "hf_path_prefix", config.huggingface.path_prefix)
+    _set_if_missing(args, "hf_bin", config.huggingface.hf_bin)
+    _set_if_missing(args, "hf_token", config.huggingface.token)
+    _set_if_missing(args, "hf_private", config.huggingface.private)
     _set_if_missing(args, "hub_url", config.hub.resolved_url())
     _set_if_missing(args, "api_token", config.auth.api_token)
     _set_if_missing(args, "private_key", config.task_signing.private_key_b64)
     _set_if_missing(args, "agent_id", config.agent.id)
 
+    _set_env_if_missing("ORBIT_STORE_PROVIDER", config.storage.provider)
     _set_env_if_missing("ORBIT_GITHUB_OWNER", config.github.owner)
     _set_env_if_missing("ORBIT_GITHUB_REPO", config.github.repo)
     _set_env_if_missing("ORBIT_GITHUB_RELEASE_PREFIX", config.github.release_prefix)
     _set_env_if_missing("ORBIT_GH_BIN", config.github.gh_bin)
+    _set_env_if_missing("ORBIT_HF_REPO_ID", config.huggingface.repo_id)
+    _set_env_if_missing("ORBIT_HF_REPO_TYPE", config.huggingface.repo_type)
+    _set_env_if_missing("ORBIT_HF_PATH_PREFIX", config.huggingface.path_prefix)
+    _set_env_if_missing("ORBIT_HF_BIN", config.huggingface.hf_bin)
+    _set_env_if_missing("ORBIT_HF_TOKEN", config.huggingface.token)
+    _set_env_if_missing("ORBIT_HF_PRIVATE", "true" if config.huggingface.private else "false")
     _set_env_if_missing("ORBIT_API_TOKEN", config.auth.api_token)
     _set_env_if_missing("ORBIT_TICKET_SECRET", config.auth.ticket_secret)
     _set_env_if_missing("ORBIT_TASK_PRIVATE_KEY_B64", config.task_signing.private_key_b64)
@@ -74,12 +93,7 @@ def _apply_config_defaults(args: argparse.Namespace, config: OrbitConfig) -> Non
 
 
 def _build_object_store(args: argparse.Namespace) -> ObjectStore:
-    backend = GitHubGhCliBackend(
-        owner=args.github_owner,
-        repo=args.github_repo,
-        release_prefix=args.github_release_prefix,
-        gh_bin=args.gh_bin,
-    )
+    backend = build_backend_from_config(args._orbit_config, args)
     return ObjectStore(backend)
 
 
@@ -112,10 +126,23 @@ def _validate_required(parser: argparse.ArgumentParser, args: argparse.Namespace
 def cmd_init_hub(args: argparse.Namespace) -> int:
     config_path, config = load_config(args.config)
 
-    config.github.owner = _prompt("GitHub owner", config.github.owner, required=True)
-    config.github.repo = _prompt("GitHub relay repo", config.github.repo, required=True)
-    config.github.release_prefix = _prompt("GitHub release prefix", config.github.release_prefix)
-    config.github.gh_bin = _prompt("gh binary", config.github.gh_bin)
+    config.storage.provider = _prompt("Storage provider", config.storage.provider or "github", required=True)
+    if config.storage.provider == "github":
+        config.github.owner = _prompt("GitHub owner", config.github.owner, required=True)
+        config.github.repo = _prompt("GitHub relay repo", config.github.repo, required=True)
+        config.github.release_prefix = _prompt("GitHub release prefix", config.github.release_prefix)
+        config.github.gh_bin = _prompt("gh binary", config.github.gh_bin)
+    elif config.storage.provider == "huggingface":
+        config.huggingface.repo_id = _prompt("HF repo id", config.huggingface.repo_id, required=True)
+        config.huggingface.repo_type = _prompt("HF repo type", config.huggingface.repo_type)
+        config.huggingface.path_prefix = _prompt("HF path prefix", config.huggingface.path_prefix)
+        config.huggingface.hf_bin = _prompt("hf binary", config.huggingface.hf_bin)
+        config.huggingface.private = _prompt(
+            "HF create private repo (true/false)",
+            "true" if config.huggingface.private else "false",
+        ).lower() in {"1", "true", "yes", "y"}
+    else:
+        raise SystemExit(f"unsupported storage provider: {config.storage.provider}")
     config.hub.host = _prompt("Hub bind host", config.hub.host)
     config.hub.port = int(_prompt("Hub bind port", str(config.hub.port)))
     config.hub.db = _prompt("Hub sqlite path", config.hub.db)
@@ -139,10 +166,23 @@ def cmd_init_agent(args: argparse.Namespace) -> int:
     default_agent_id = args.agent_id or config.agent.id
     config.agent.id = _prompt("Agent ID", default_agent_id, required=True)
     config.hub.url = _prompt("Hub URL", config.hub.resolved_url(), required=True)
-    config.github.owner = _prompt("GitHub owner", config.github.owner, required=True)
-    config.github.repo = _prompt("GitHub relay repo", config.github.repo, required=True)
-    config.github.release_prefix = _prompt("GitHub release prefix", config.github.release_prefix)
-    config.github.gh_bin = _prompt("gh binary", config.github.gh_bin)
+    config.storage.provider = _prompt("Storage provider", config.storage.provider or "github", required=True)
+    if config.storage.provider == "github":
+        config.github.owner = _prompt("GitHub owner", config.github.owner, required=True)
+        config.github.repo = _prompt("GitHub relay repo", config.github.repo, required=True)
+        config.github.release_prefix = _prompt("GitHub release prefix", config.github.release_prefix)
+        config.github.gh_bin = _prompt("gh binary", config.github.gh_bin)
+    elif config.storage.provider == "huggingface":
+        config.huggingface.repo_id = _prompt("HF repo id", config.huggingface.repo_id, required=True)
+        config.huggingface.repo_type = _prompt("HF repo type", config.huggingface.repo_type)
+        config.huggingface.path_prefix = _prompt("HF path prefix", config.huggingface.path_prefix)
+        config.huggingface.hf_bin = _prompt("hf binary", config.huggingface.hf_bin)
+        config.huggingface.private = _prompt(
+            "HF create private repo (true/false)",
+            "true" if config.huggingface.private else "false",
+        ).lower() in {"1", "true", "yes", "y"}
+    else:
+        raise SystemExit(f"unsupported storage provider: {config.storage.provider}")
     config.auth.api_token = _prompt("Hub API token", config.auth.api_token, required=True)
     config.auth.ticket_secret = _prompt("Run ticket secret", config.auth.ticket_secret, required=True)
     config.task_signing.public_key_b64 = _prompt(
@@ -303,24 +343,26 @@ def cmd_run_result(args: argparse.Namespace) -> int:
 def cmd_relay_clean(args: argparse.Namespace) -> int:
     if not args.yes:
         raise SystemExit("relay clean is destructive; re-run with --yes")
-    backend = GitHubGhCliBackend(
-        owner=args.github_owner,
-        repo=args.github_repo,
-        release_prefix=args.github_release_prefix,
-        gh_bin=args.gh_bin,
-    )
-    deleted = backend.purge_managed_releases()
-    print(
-        json.dumps(
-            {
-                "repo": f"{args.github_owner}/{args.github_repo}",
-                "release_prefix": args.github_release_prefix,
-                "deleted_releases": deleted,
-            },
-            ensure_ascii=False,
-            indent=2,
-        )
-    )
+    backend = build_backend_from_config(args._orbit_config, args)
+    if isinstance(backend, GitHubGhCliBackend):
+        deleted = backend.purge_managed_releases()
+        payload = {
+            "provider": "github",
+            "repo": f"{args.github_owner}/{args.github_repo}",
+            "release_prefix": args.github_release_prefix,
+            "deleted_releases": deleted,
+        }
+    elif isinstance(backend, HuggingFaceCliBackend):
+        deleted = backend.purge_managed_paths()
+        payload = {
+            "provider": "huggingface",
+            "repo_id": args.hf_repo_id,
+            "path_prefix": args.hf_path_prefix,
+            "deleted_patterns": deleted,
+        }
+    else:
+        raise SystemExit(f"relay clean is not supported for backend: {type(backend).__name__}")
+    print(json.dumps(payload, ensure_ascii=False, indent=2))
     return 0
 
 
@@ -345,14 +387,30 @@ def cmd_keys_generate(args: argparse.Namespace) -> int:
     return 0
 
 
-def _add_github_store_args(parser: argparse.ArgumentParser) -> None:
+def _add_storage_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--store-provider",
+        choices=["github", "huggingface"],
+        default=os.getenv("ORBIT_STORE_PROVIDER"),
+        required=False,
+    )
     parser.add_argument("--github-owner", default=os.getenv("ORBIT_GITHUB_OWNER"), required=False)
     parser.add_argument("--github-repo", default=os.getenv("ORBIT_GITHUB_REPO"), required=False)
     parser.add_argument(
         "--github-release-prefix",
-        default=os.getenv("ORBIT_GITHUB_RELEASE_PREFIX", "mvp-orbit"),
+        default=os.getenv("ORBIT_GITHUB_RELEASE_PREFIX"),
     )
-    parser.add_argument("--gh-bin", default=os.getenv("ORBIT_GH_BIN", "gh"))
+    parser.add_argument("--gh-bin", default=os.getenv("ORBIT_GH_BIN"))
+    parser.add_argument("--hf-repo-id", default=os.getenv("ORBIT_HF_REPO_ID"), required=False)
+    parser.add_argument(
+        "--hf-repo-type",
+        choices=["model", "dataset", "space"],
+        default=os.getenv("ORBIT_HF_REPO_TYPE"),
+    )
+    parser.add_argument("--hf-path-prefix", default=os.getenv("ORBIT_HF_PATH_PREFIX"))
+    parser.add_argument("--hf-bin", default=os.getenv("ORBIT_HF_BIN"))
+    parser.add_argument("--hf-token", default=os.getenv("ORBIT_HF_TOKEN"))
+    parser.add_argument("--hf-private", dest="hf_private", action=argparse.BooleanOptionalAction, default=None)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -373,14 +431,14 @@ def build_parser() -> argparse.ArgumentParser:
     package_upload = package_sub.add_parser("upload", help="build and upload a file package")
     package_upload.add_argument("--source-dir", required=True)
     package_upload.add_argument("--tmp-dir", default=None)
-    _add_github_store_args(package_upload)
+    _add_storage_args(package_upload)
     package_upload.set_defaults(func=cmd_package_upload)
 
     command = sub.add_parser("command", help="command object commands")
     command_sub = command.add_subparsers(dest="command_command", required=True)
     command_upload = command_sub.add_parser("upload", help="upload a command object from JSON")
     command_upload.add_argument("--file", required=True)
-    _add_github_store_args(command_upload)
+    _add_storage_args(command_upload)
     command_upload.set_defaults(func=cmd_command_upload)
 
     task = sub.add_parser("task", help="task object commands")
@@ -393,7 +451,7 @@ def build_parser() -> argparse.ArgumentParser:
     task_upload.add_argument("--created-by", default=os.getenv("USER"))
     task_upload.add_argument("--private-key", default=None)
     task_upload.add_argument("--signer", default=None)
-    _add_github_store_args(task_upload)
+    _add_storage_args(task_upload)
     task_upload.set_defaults(func=cmd_task_upload)
 
     run = sub.add_parser("run", help="run commands")
@@ -424,21 +482,21 @@ def build_parser() -> argparse.ArgumentParser:
     run_logs.add_argument("--api-token", default=os.getenv("ORBIT_API_TOKEN"))
     run_logs.add_argument("--follow", action="store_true")
     run_logs.add_argument("--poll-interval-sec", type=float, default=2.0)
-    _add_github_store_args(run_logs)
+    _add_storage_args(run_logs)
     run_logs.set_defaults(func=cmd_run_logs)
 
     run_result = run_sub.add_parser("result", help="fetch result via Hub id + GitHub object")
     run_result.add_argument("--hub-url", default=None)
     run_result.add_argument("--run-id", required=True)
     run_result.add_argument("--api-token", default=os.getenv("ORBIT_API_TOKEN"))
-    _add_github_store_args(run_result)
+    _add_storage_args(run_result)
     run_result.set_defaults(func=cmd_run_result)
 
     relay = sub.add_parser("relay", help="relay repository maintenance commands")
     relay_sub = relay.add_subparsers(dest="relay_command", required=True)
     relay_clean = relay_sub.add_parser("clean", help="delete mvp-orbit managed releases in the relay repo")
     relay_clean.add_argument("--yes", action="store_true", help="confirm deletion")
-    _add_github_store_args(relay_clean)
+    _add_storage_args(relay_clean)
     relay_clean.set_defaults(func=cmd_relay_clean)
 
     agent = sub.add_parser("agent", help="agent commands")
@@ -465,15 +523,21 @@ def prepare_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> a
     args._orbit_config = config
     _apply_config_defaults(args, config)
 
-    needs_github = (
+    needs_store = (
         (args.command == "package" and args.package_command == "upload")
         or (args.command == "command" and args.command_command == "upload")
         or (args.command == "task" and args.task_command == "upload")
         or (args.command == "run" and args.run_command in {"logs", "result"})
         or (args.command == "relay" and args.relay_command == "clean")
     )
-    if needs_github:
-        _validate_required(parser, args, "github_owner", "github_repo")
+    if needs_store:
+        provider = args.store_provider or "github"
+        if provider == "github":
+            _validate_required(parser, args, "github_owner", "github_repo")
+        elif provider == "huggingface":
+            _validate_required(parser, args, "hf_repo_id")
+        else:
+            parser.error(f"unsupported --store-provider: {provider}")
 
     if args.command == "task" and args.task_command == "upload":
         _validate_required(parser, args, "private_key")
