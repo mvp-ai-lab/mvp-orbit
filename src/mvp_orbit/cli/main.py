@@ -6,9 +6,11 @@ import os
 import shutil
 import sys
 import time
+import textwrap
 from pathlib import Path
 
 import httpx
+import questionary
 
 from mvp_orbit.cli.package import build_file_package
 from mvp_orbit.config import OrbitConfig, ensure_hub_secrets, load_config, save_config
@@ -21,6 +23,177 @@ from mvp_orbit.integrations.object_store import (
     ObjectStore,
     build_backend_from_config,
 )
+
+
+class SetupWizard:
+    def __init__(self, title: str, subtitle: str) -> None:
+        self.title = title
+        self.subtitle = subtitle
+        self.width = min(92, shutil.get_terminal_size((92, 24)).columns)
+        self.color = sys.stdout.isatty() and os.getenv("TERM", "dumb") != "dumb" and not os.getenv("NO_COLOR")
+        self.interactive = sys.stdin.isatty() and sys.stdout.isatty() and os.getenv("TERM", "dumb") != "dumb"
+        self.qstyle = questionary.Style(
+            [
+                ("qmark", "fg:#23b7d9 bold"),
+                ("question", "fg:#e8f1f2 bold"),
+                ("answer", "fg:#77e0c6 bold"),
+                ("pointer", "fg:#ffcf56 bold"),
+                ("highlighted", "fg:#ffcf56 bold"),
+                ("selected", "fg:#77e0c6"),
+                ("separator", "fg:#6a7d89"),
+                ("instruction", "fg:#6a7d89"),
+                ("text", "fg:#e8f1f2"),
+                ("disabled", "fg:#6a7d89 italic"),
+            ]
+        )
+        self._print_banner()
+
+    def _style(self, text: str, code: str) -> str:
+        if not self.color:
+            return text
+        return f"\033[{code}m{text}\033[0m"
+
+    def _accent(self, text: str) -> str:
+        return self._style(text, "38;5;45;1")
+
+    def _muted(self, text: str) -> str:
+        return self._style(text, "38;5;246")
+
+    def _success(self, text: str) -> str:
+        return self._style(text, "38;5;84;1")
+
+    def _warning(self, text: str) -> str:
+        return self._style(text, "38;5;221;1")
+
+    def _line(self, fill: str = "=") -> str:
+        return fill * self.width
+
+    def _print_banner(self) -> None:
+        print(self._accent(self._line("=")))
+        print(self._accent(self.title.center(self.width)))
+        print(self._muted(self.subtitle.center(self.width)))
+        print(self._accent(self._line("=")))
+        print()
+
+    def section(self, title: str, description: str | None = None) -> None:
+        header = f"[ {title} ]"
+        print()
+        print(self._accent(header))
+        if description:
+            for line in textwrap.wrap(description, width=max(40, self.width - 2)):
+                print(self._muted(line))
+        print(self._muted(self._line("-")))
+        print()
+
+    def note(self, text: str) -> None:
+        for line in textwrap.wrap(text, width=max(40, self.width - 2)):
+            print(self._muted(line))
+
+    def _fallback_prompt(self, label: str, default: str | None = None, *, required: bool = False) -> str:
+        suffix = f" [{default}]" if default not in (None, "") else ""
+        while True:
+            value = input(f"{label}{suffix}: ").strip()
+            if value:
+                return value
+            if default not in (None, ""):
+                return str(default)
+            if not required:
+                return ""
+
+    def prompt(
+        self,
+        label: str,
+        default: str | None = None,
+        *,
+        required: bool = False,
+        hint: str | None = None,
+        secret: bool = False,
+    ) -> str:
+        if hint:
+            self.note(hint)
+        if not self.interactive:
+            return self._fallback_prompt(label, default, required=required)
+
+        while True:
+            prompt_fn = questionary.password if secret else questionary.text
+            question = prompt_fn(
+                label,
+                default=default,
+                qmark="◆",
+                style=self.qstyle,
+                instruction="press Enter to confirm",
+            )
+            value = question.ask()
+            if value is None:
+                raise KeyboardInterrupt
+            value = value.strip()
+            if value:
+                return value
+            if default not in (None, ""):
+                return str(default)
+            if not required:
+                return ""
+            print(self._warning("value required"))
+
+    def choice(self, label: str, options: list[str], default: str | None = None, *, hint: str | None = None) -> str:
+        if hint:
+            self.note(hint)
+        if self.interactive:
+            result = questionary.select(
+                label,
+                choices=options,
+                default=default,
+                qmark="◆",
+                pointer="▸",
+                style=self.qstyle,
+                instruction="use arrow keys",
+            ).ask()
+            if result is None:
+                raise KeyboardInterrupt
+            return result
+        for idx, option in enumerate(options, start=1):
+            default_tag = " (default)" if option == default else ""
+            print(f"  {self._accent(str(idx) + '.')} {option}{self._muted(default_tag)}")
+        while True:
+            value = input(f"{self._accent('>')} {label}\n{self._muted('  select: ')}").strip()
+            if not value and default:
+                return default
+            if value.isdigit():
+                index = int(value) - 1
+                if 0 <= index < len(options):
+                    return options[index]
+            for option in options:
+                if value.lower() == option.lower():
+                    return option
+            print(self._warning("  choose by number or exact option text"))
+
+    def boolean(self, label: str, default: bool, *, hint: str | None = None) -> bool:
+        if hint:
+            self.note(hint)
+        if self.interactive:
+            result = questionary.confirm(
+                label,
+                default=default,
+                qmark="◆",
+                style=self.qstyle,
+                instruction="press y/n",
+            ).ask()
+            if result is None:
+                raise KeyboardInterrupt
+            return bool(result)
+        selected = self.choice(
+            label,
+            ["true", "false"],
+            default="true" if default else "false",
+        )
+        return selected == "true"
+
+    def summary(self, title: str, lines: list[str]) -> None:
+        print()
+        print(self._success(f"[ {title} ]"))
+        for line in lines:
+            print(f"  {line}")
+        print()
 
 
 def _read_private_key(value: str) -> str:
@@ -104,17 +277,22 @@ def _load_json(path: str) -> dict:
 def _is_terminal_status(value: str) -> bool:
     return value in {RunStatus.SUCCEEDED.value, RunStatus.FAILED.value, RunStatus.REJECTED.value, RunStatus.CANCELED.value}
 
-
-def _prompt(text: str, default: str | None = None, *, required: bool = False) -> str:
-    suffix = f" [{default}]" if default not in (None, "") else ""
+def _prompt_int(wizard: SetupWizard, label: str, default: int, *, hint: str | None = None) -> int:
     while True:
-        value = input(f"{text}{suffix}: ").strip()
-        if value:
-            return value
-        if default not in (None, ""):
-            return str(default)
-        if not required:
-            return ""
+        value = wizard.prompt(label, str(default), required=True, hint=hint)
+        try:
+            return int(value)
+        except ValueError:
+            print(wizard._warning("  enter an integer"))
+
+
+def _prompt_float(wizard: SetupWizard, label: str, default: float, *, hint: str | None = None) -> float:
+    while True:
+        value = wizard.prompt(label, str(default), required=True, hint=hint)
+        try:
+            return float(value)
+        except ValueError:
+            print(wizard._warning("  enter a number"))
 
 
 def _validate_required(parser: argparse.ArgumentParser, args: argparse.Namespace, *names: str) -> None:
@@ -123,39 +301,73 @@ def _validate_required(parser: argparse.ArgumentParser, args: argparse.Namespace
         parser.error(f"missing required configuration/arguments: {', '.join('--' + name.replace('_', '-') for name in missing)}")
 
 
-def _prompt_storage_config(config: OrbitConfig) -> None:
-    config.storage.provider = _prompt("Storage provider", config.storage.provider or "github", required=True)
+def _prompt_storage_config(config: OrbitConfig, wizard: SetupWizard) -> None:
+    wizard.section(
+        "Relay Backend",
+        "Choose the shared object store that every node will use for packages, commands, tasks, logs, and results.",
+    )
+    config.storage.provider = wizard.choice(
+        "Storage provider",
+        ["github", "huggingface"],
+        default=config.storage.provider or "github",
+    )
     if config.storage.provider == "github":
-        config.github.owner = _prompt("GitHub owner", config.github.owner, required=True)
-        config.github.repo = _prompt("GitHub relay repo", config.github.repo, required=True)
-        config.github.release_prefix = _prompt("GitHub release prefix", config.github.release_prefix)
-        config.github.gh_bin = _prompt("gh binary", config.github.gh_bin)
+        config.github.owner = wizard.prompt(
+            "GitHub owner",
+            config.github.owner,
+            required=True,
+            hint="The relay repo will be addressed as owner/repo through the gh CLI.",
+        )
+        config.github.repo = wizard.prompt("GitHub relay repo", config.github.repo, required=True)
+        config.github.release_prefix = wizard.prompt("GitHub release prefix", config.github.release_prefix)
+        config.github.gh_bin = wizard.prompt("gh binary", config.github.gh_bin)
         return
     if config.storage.provider == "huggingface":
-        config.huggingface.repo_id = _prompt("HF repo id", config.huggingface.repo_id, required=True)
-        config.huggingface.repo_type = _prompt("HF repo type", config.huggingface.repo_type)
-        config.huggingface.path_prefix = _prompt("HF path prefix", config.huggingface.path_prefix)
-        config.huggingface.hf_bin = _prompt("hf binary", config.huggingface.hf_bin)
-        config.huggingface.private = _prompt(
-            "HF create private repo (true/false)",
-            "true" if config.huggingface.private else "false",
-        ).lower() in {"1", "true", "yes", "y"}
+        config.huggingface.repo_id = wizard.prompt("HF repo id", config.huggingface.repo_id, required=True)
+        config.huggingface.repo_type = wizard.choice(
+            "HF repo type",
+            ["dataset", "model", "space"],
+            default=config.huggingface.repo_type,
+        )
+        config.huggingface.path_prefix = wizard.prompt("HF path prefix", config.huggingface.path_prefix)
+        config.huggingface.hf_bin = wizard.prompt("hf binary", config.huggingface.hf_bin)
+        config.huggingface.private = wizard.boolean("Create or use a private repo", config.huggingface.private)
         return
     raise SystemExit(f"unsupported storage provider: {config.storage.provider}")
 
 
 def cmd_init_hub(args: argparse.Namespace) -> int:
     config_path, config = load_config(args.config)
+    wizard = SetupWizard(
+        "ORBIT HUB SETUP",
+        "Configure the control plane, relay backend, and shared credentials for all nodes.",
+    )
 
-    _prompt_storage_config(config)
-    config.hub.host = _prompt("Hub bind host", config.hub.host)
-    config.hub.port = int(_prompt("Hub bind port", str(config.hub.port)))
-    config.hub.db = _prompt("Hub sqlite path", config.hub.db)
-    config.hub.url = _prompt("Hub public URL", config.hub.resolved_url())
+    _prompt_storage_config(config, wizard)
+    wizard.section(
+        "Hub Service",
+        "These values define where the Hub listens and which public URL nodes should use to reach it.",
+    )
+    config.hub.host = wizard.prompt("Hub bind host", config.hub.host)
+    config.hub.port = _prompt_int(wizard, "Hub bind port", config.hub.port)
+    config.hub.db = wizard.prompt("Hub sqlite path", config.hub.db)
+    config.hub.url = wizard.prompt("Hub public URL", config.hub.resolved_url())
 
     ensure_hub_secrets(config)
     saved_path = save_config(config, config_path)
 
+    wizard.section(
+        "Shared Credentials",
+        "Every node that should submit tasks needs the Hub API token, ticket secret, and task signing private key.",
+    )
+    wizard.summary(
+        "Hub Ready",
+        [
+            f"Config saved: {saved_path}",
+            f"Hub URL: {config.hub.resolved_url()}",
+            "Distribute the printed credentials to every submitting node.",
+        ],
+    )
     print(f"Wrote Hub config to {saved_path}")
     print(f"Hub URL: {config.hub.resolved_url()}")
     print(f"ORBIT_API_TOKEN={config.auth.api_token}")
@@ -168,28 +380,56 @@ def cmd_init_hub(args: argparse.Namespace) -> int:
 
 def cmd_init_node(args: argparse.Namespace) -> int:
     config_path, config = load_config(args.config)
+    wizard = SetupWizard(
+        "ORBIT NODE SETUP",
+        "Configure one machine to submit work through the Hub and execute work as an agent.",
+    )
 
     default_agent_id = args.agent_id or config.agent.id
-    config.agent.id = _prompt("Agent ID", default_agent_id, required=True)
-    config.hub.url = _prompt("Hub URL", config.hub.resolved_url(), required=True)
-    _prompt_storage_config(config)
-    config.auth.api_token = _prompt("Hub API token", config.auth.api_token, required=True)
-    config.auth.ticket_secret = _prompt("Run ticket secret", config.auth.ticket_secret, required=True)
+    wizard.section(
+        "Identity",
+        "This node ID is how the Hub targets remote runs. The same machine can both submit tasks and execute them.",
+    )
+    config.agent.id = wizard.prompt("Agent ID", default_agent_id, required=True)
+    config.hub.url = wizard.prompt("Hub URL", config.hub.resolved_url(), required=True)
+    _prompt_storage_config(config, wizard)
+    wizard.section(
+        "Hub Credentials",
+        "Paste the shared values generated by `orbit init hub`. Nodes use these to submit runs and verify leases.",
+    )
+    config.auth.api_token = wizard.prompt("Hub API token", config.auth.api_token, required=True, secret=True)
+    config.auth.ticket_secret = wizard.prompt("Run ticket secret", config.auth.ticket_secret, required=True, secret=True)
     config.task_signing.private_key_b64 = _read_private_key(
-        _prompt(
+        wizard.prompt(
             "Task private key",
             config.task_signing.private_key_b64,
             required=True,
+            hint="You can paste the base64 key directly or enter a path to a file that contains it.",
         )
     )
     config.task_signing.public_key_b64 = public_key_from_private_key_b64(config.task_signing.private_key_b64)
-    config.agent.workspace_root = _prompt("Workspace root", config.agent.workspace_root)
-    config.agent.poll_interval_sec = float(_prompt("Poll interval seconds", str(config.agent.poll_interval_sec)))
-    config.agent.heartbeat_interval_sec = float(
-        _prompt("Heartbeat interval seconds", str(config.agent.heartbeat_interval_sec))
+    wizard.section(
+        "Runtime",
+        "Workspace and polling settings control how the local agent runs jobs after the Hub assigns them.",
+    )
+    config.agent.workspace_root = wizard.prompt("Workspace root", config.agent.workspace_root)
+    config.agent.poll_interval_sec = _prompt_float(wizard, "Poll interval seconds", config.agent.poll_interval_sec)
+    config.agent.heartbeat_interval_sec = _prompt_float(
+        wizard,
+        "Heartbeat interval seconds",
+        config.agent.heartbeat_interval_sec,
     )
 
     saved_path = save_config(config, config_path)
+    wizard.summary(
+        "Node Ready",
+        [
+            f"Config saved: {saved_path}",
+            f"Agent ID: {config.agent.id}",
+            f"Hub URL: {config.hub.resolved_url()}",
+            "This node can upload packages, commands, signed tasks, submit runs, and execute work as an agent.",
+        ],
+    )
     print(f"Wrote node config to {saved_path}")
     print(f"Agent ID: {config.agent.id}")
     print(f"Hub URL: {config.hub.resolved_url()}")

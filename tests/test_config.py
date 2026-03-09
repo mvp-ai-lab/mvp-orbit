@@ -41,6 +41,8 @@ def test_init_hub_writes_default_config(monkeypatch, tmp_path, capsys):
     assert config.task_signing.public_key_b64
 
     output = capsys.readouterr().out
+    assert "ORBIT HUB SETUP" in output
+    assert "[ Hub Ready ]" in output
     assert str(config_path) in output
     assert "ORBIT_TASK_PRIVATE_KEY_B64=" in output
     assert "ORBIT_TASK_PUBLIC_KEY_B64=" in output
@@ -81,6 +83,39 @@ def test_init_node_writes_submitter_and_agent_config(monkeypatch, tmp_path):
     assert config.auth.ticket_secret == "ticket-secret"
     assert config.task_signing.private_key_b64 == "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
     assert config.task_signing.public_key_b64 == public_key_from_private_key_b64(config.task_signing.private_key_b64)
+
+
+def test_init_node_renders_wizard_summary(monkeypatch, tmp_path, capsys):
+    config_path = tmp_path / "config.toml"
+    monkeypatch.setenv("ORBIT_CONFIG", str(config_path))
+
+    answers = iter(
+        [
+            "agent-a",
+            "http://127.0.0.1:10551",
+            "github",
+            "GeoffreyChen777",
+            "mvp-orbit-relay",
+            "",
+            "",
+            "api-token",
+            "ticket-secret",
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+            "",
+            "",
+            "",
+        ]
+    )
+    monkeypatch.setattr("builtins.input", lambda _: next(answers))
+
+    try:
+        main(["init", "node"])
+    except SystemExit as exc:
+        assert exc.code == 0
+
+    output = capsys.readouterr().out
+    assert "ORBIT NODE SETUP" in output
+    assert "[ Node Ready ]" in output
 
 
 def test_prepare_args_uses_config_defaults(monkeypatch, tmp_path):
