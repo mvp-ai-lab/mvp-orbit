@@ -14,7 +14,7 @@ from mvp_orbit.cli.package import build_file_package
 from mvp_orbit.config import OrbitConfig, ensure_hub_secrets, load_config, save_config
 from mvp_orbit.core.canonical import object_id_for_json
 from mvp_orbit.core.models import CommandObject, RunCreateRequest, RunStatus, SignedTaskObject, TaskObject, utc_now
-from mvp_orbit.core.signing import generate_keypair_b64, sign_payload
+from mvp_orbit.core.signing import generate_keypair_b64, public_key_from_private_key_b64, sign_payload
 from mvp_orbit.integrations.object_store import (
     GitHubGhCliBackend,
     HuggingFaceCliBackend,
@@ -123,16 +123,15 @@ def _validate_required(parser: argparse.ArgumentParser, args: argparse.Namespace
         parser.error(f"missing required configuration/arguments: {', '.join('--' + name.replace('_', '-') for name in missing)}")
 
 
-def cmd_init_hub(args: argparse.Namespace) -> int:
-    config_path, config = load_config(args.config)
-
+def _prompt_storage_config(config: OrbitConfig) -> None:
     config.storage.provider = _prompt("Storage provider", config.storage.provider or "github", required=True)
     if config.storage.provider == "github":
         config.github.owner = _prompt("GitHub owner", config.github.owner, required=True)
         config.github.repo = _prompt("GitHub relay repo", config.github.repo, required=True)
         config.github.release_prefix = _prompt("GitHub release prefix", config.github.release_prefix)
         config.github.gh_bin = _prompt("gh binary", config.github.gh_bin)
-    elif config.storage.provider == "huggingface":
+        return
+    if config.storage.provider == "huggingface":
         config.huggingface.repo_id = _prompt("HF repo id", config.huggingface.repo_id, required=True)
         config.huggingface.repo_type = _prompt("HF repo type", config.huggingface.repo_type)
         config.huggingface.path_prefix = _prompt("HF path prefix", config.huggingface.path_prefix)
@@ -141,8 +140,14 @@ def cmd_init_hub(args: argparse.Namespace) -> int:
             "HF create private repo (true/false)",
             "true" if config.huggingface.private else "false",
         ).lower() in {"1", "true", "yes", "y"}
-    else:
-        raise SystemExit(f"unsupported storage provider: {config.storage.provider}")
+        return
+    raise SystemExit(f"unsupported storage provider: {config.storage.provider}")
+
+
+def cmd_init_hub(args: argparse.Namespace) -> int:
+    config_path, config = load_config(args.config)
+
+    _prompt_storage_config(config)
     config.hub.host = _prompt("Hub bind host", config.hub.host)
     config.hub.port = int(_prompt("Hub bind port", str(config.hub.port)))
     config.hub.db = _prompt("Hub sqlite path", config.hub.db)
@@ -155,41 +160,29 @@ def cmd_init_hub(args: argparse.Namespace) -> int:
     print(f"Hub URL: {config.hub.resolved_url()}")
     print(f"ORBIT_API_TOKEN={config.auth.api_token}")
     print(f"ORBIT_TICKET_SECRET={config.auth.ticket_secret}")
+    print(f"ORBIT_TASK_PRIVATE_KEY_B64={config.task_signing.private_key_b64}")
     print(f"ORBIT_TASK_PUBLIC_KEY_B64={config.task_signing.public_key_b64}")
-    print("Task private key has been stored in the config file for local task signing.")
+    print("Distribute the API token, ticket secret, and task keypair to every node that should submit tasks.")
     return 0
 
 
-def cmd_init_agent(args: argparse.Namespace) -> int:
+def cmd_init_node(args: argparse.Namespace) -> int:
     config_path, config = load_config(args.config)
 
     default_agent_id = args.agent_id or config.agent.id
     config.agent.id = _prompt("Agent ID", default_agent_id, required=True)
     config.hub.url = _prompt("Hub URL", config.hub.resolved_url(), required=True)
-    config.storage.provider = _prompt("Storage provider", config.storage.provider or "github", required=True)
-    if config.storage.provider == "github":
-        config.github.owner = _prompt("GitHub owner", config.github.owner, required=True)
-        config.github.repo = _prompt("GitHub relay repo", config.github.repo, required=True)
-        config.github.release_prefix = _prompt("GitHub release prefix", config.github.release_prefix)
-        config.github.gh_bin = _prompt("gh binary", config.github.gh_bin)
-    elif config.storage.provider == "huggingface":
-        config.huggingface.repo_id = _prompt("HF repo id", config.huggingface.repo_id, required=True)
-        config.huggingface.repo_type = _prompt("HF repo type", config.huggingface.repo_type)
-        config.huggingface.path_prefix = _prompt("HF path prefix", config.huggingface.path_prefix)
-        config.huggingface.hf_bin = _prompt("hf binary", config.huggingface.hf_bin)
-        config.huggingface.private = _prompt(
-            "HF create private repo (true/false)",
-            "true" if config.huggingface.private else "false",
-        ).lower() in {"1", "true", "yes", "y"}
-    else:
-        raise SystemExit(f"unsupported storage provider: {config.storage.provider}")
+    _prompt_storage_config(config)
     config.auth.api_token = _prompt("Hub API token", config.auth.api_token, required=True)
     config.auth.ticket_secret = _prompt("Run ticket secret", config.auth.ticket_secret, required=True)
-    config.task_signing.public_key_b64 = _prompt(
-        "Task public key",
-        config.task_signing.public_key_b64,
-        required=True,
+    config.task_signing.private_key_b64 = _read_private_key(
+        _prompt(
+            "Task private key",
+            config.task_signing.private_key_b64,
+            required=True,
+        )
     )
+    config.task_signing.public_key_b64 = public_key_from_private_key_b64(config.task_signing.private_key_b64)
     config.agent.workspace_root = _prompt("Workspace root", config.agent.workspace_root)
     config.agent.poll_interval_sec = float(_prompt("Poll interval seconds", str(config.agent.poll_interval_sec)))
     config.agent.heartbeat_interval_sec = float(
@@ -197,10 +190,15 @@ def cmd_init_agent(args: argparse.Namespace) -> int:
     )
 
     saved_path = save_config(config, config_path)
-    print(f"Wrote Agent config to {saved_path}")
+    print(f"Wrote node config to {saved_path}")
     print(f"Agent ID: {config.agent.id}")
     print(f"Hub URL: {config.hub.resolved_url()}")
+    print("This node can upload packages, commands, signed tasks, submit runs, and execute work as an agent.")
     return 0
+
+
+def cmd_init_agent(args: argparse.Namespace) -> int:
+    return cmd_init_node(args)
 
 
 def cmd_package_upload(args: argparse.Namespace) -> int:
@@ -422,7 +420,10 @@ def build_parser() -> argparse.ArgumentParser:
     init_sub = init.add_subparsers(dest="init_command", required=True)
     init_hub = init_sub.add_parser("hub", help="interactively create/update Hub config")
     init_hub.set_defaults(func=cmd_init_hub)
-    init_agent = init_sub.add_parser("agent", help="interactively create/update Agent config")
+    init_node = init_sub.add_parser("node", help="interactively create/update a node config for submit + agent execution")
+    init_node.add_argument("--agent-id", default=None)
+    init_node.set_defaults(func=cmd_init_node)
+    init_agent = init_sub.add_parser("agent", help="alias for `orbit init node`")
     init_agent.add_argument("--agent-id", default=None)
     init_agent.set_defaults(func=cmd_init_agent)
 

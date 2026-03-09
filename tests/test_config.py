@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from mvp_orbit.cli.main import build_parser, main, prepare_args
 from mvp_orbit.config import load_config
+from mvp_orbit.core.signing import public_key_from_private_key_b64
 
 
 def test_init_hub_writes_default_config(monkeypatch, tmp_path, capsys):
@@ -41,6 +42,45 @@ def test_init_hub_writes_default_config(monkeypatch, tmp_path, capsys):
 
     output = capsys.readouterr().out
     assert str(config_path) in output
+    assert "ORBIT_TASK_PRIVATE_KEY_B64=" in output
+    assert "ORBIT_TASK_PUBLIC_KEY_B64=" in output
+
+
+def test_init_node_writes_submitter_and_agent_config(monkeypatch, tmp_path):
+    config_path = tmp_path / "config.toml"
+    monkeypatch.setenv("ORBIT_CONFIG", str(config_path))
+
+    answers = iter(
+        [
+            "agent-a",
+            "http://127.0.0.1:10551",
+            "github",
+            "GeoffreyChen777",
+            "mvp-orbit-relay",
+            "",
+            "",
+            "api-token",
+            "ticket-secret",
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+            "",
+            "",
+            "",
+        ]
+    )
+    monkeypatch.setattr("builtins.input", lambda _: next(answers))
+
+    try:
+        main(["init", "node"])
+    except SystemExit as exc:
+        assert exc.code == 0
+
+    _, config = load_config(config_path)
+    assert config.agent.id == "agent-a"
+    assert config.hub.url == "http://127.0.0.1:10551"
+    assert config.auth.api_token == "api-token"
+    assert config.auth.ticket_secret == "ticket-secret"
+    assert config.task_signing.private_key_b64 == "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+    assert config.task_signing.public_key_b64 == public_key_from_private_key_b64(config.task_signing.private_key_b64)
 
 
 def test_prepare_args_uses_config_defaults(monkeypatch, tmp_path):

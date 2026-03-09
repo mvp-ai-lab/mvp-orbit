@@ -45,12 +45,13 @@ Typical examples:
 - Git-aware file selection that respects `.gitignore`
 - command upload as structured JSON
 - task creation from `file_package + command`
+- package, command, task, and run submission from any configured node
 - Hub-based run submission to a specific `agent_id`
 - Agent pull mode execution
 - stdout/stderr collection
 - exit code and final status reporting
 - GitHub-backed storage for packages, commands, tasks, logs, and results
-- interactive initialization for Hub and Agent
+- interactive initialization for Hub and nodes
 
 In practice, this makes it useful as a lightweight execution loop for AI-assisted development:
 
@@ -78,10 +79,13 @@ This keeps the workflow simple:
 
 ## How it runs
 
+- one machine runs the Hub service
+- every machine, including the Hub host, can run an Agent
+- any configured node can upload packages, commands, and signed tasks, then submit runs to the Hub
 - Hub stores run metadata and object IDs
-- Agent polls the Hub for work
+- Agents poll the Hub for work
 - real task content is stored in a relay object store
-- both the developer side and the agent side use the same `orbit` CLI
+- all nodes use the same `orbit` CLI
 - configuration is kept in a default TOML file after initialization
 
 ## Current backend
@@ -107,8 +111,8 @@ You can override that path with `--config /path/to/config.toml` or `ORBIT_CONFIG
 
 - Python 3.11+
 - Either GitHub CLI (`gh`) with a relay repo, or Hugging Face CLI (`hf`) with a relay repo
-- For GitHub storage: `gh auth login` already completed on both the Hub/developer machine and the Agent machine
-- For Hugging Face storage: `hf auth login` already completed on both the Hub/developer machine and the Agent machine
+- For GitHub storage: `gh auth login` already completed on every machine that should upload or execute through the relay repo
+- For Hugging Face storage: `hf auth login` already completed on every machine that should upload or execute through the relay repo
 - Optional proxy via `HTTPS_PROXY`
 
 #### 1) Initialize Hub config interactively
@@ -132,18 +136,20 @@ It also generates and stores:
 - `ticket_secret`
 - task signing keypair
 
+Distribute the printed `api_token`, `ticket_secret`, and task signing keypair to every node that should submit work.
+
 Then start the Hub:
 
 ```bash
 orbit hub serve
 ```
 
-#### 2) Initialize Agent config interactively
+#### 2) Initialize node config interactively
 
-Run this on the Agent machine:
+Run this on every machine that should both submit work and execute as an Agent, including the Hub host:
 
 ```bash
-orbit init agent --agent-id agent-a
+orbit init node --agent-id agent-a
 ```
 
 The command prompts for:
@@ -152,7 +158,7 @@ The command prompts for:
 - Hub URL
 - Hub `api_token`
 - shared `ticket_secret`
-- task signing public key
+- task signing private key
 - storage provider
 - provider-specific relay settings
 
@@ -162,7 +168,9 @@ Then start the Agent:
 orbit agent run
 ```
 
-After this step, both Hub and Agent can use the default config file path directly.
+`orbit init agent` remains available as an alias for `orbit init node`.
+
+After this step, both Hub and nodes can use the default config file path directly.
 
 ### Usage
 

@@ -27,6 +27,11 @@ def generate_keypair_b64() -> tuple[str, str]:
     return _b64encode(private_key.private_bytes_raw()), _b64encode(public_key.public_bytes_raw())
 
 
+def public_key_from_private_key_b64(private_key_b64: str) -> str:
+    private_key = Ed25519PrivateKey.from_private_bytes(_b64decode(private_key_b64))
+    return _b64encode(private_key.public_key().public_bytes_raw())
+
+
 def sign_bytes(payload: bytes, private_key_b64: str) -> str:
     private_key = Ed25519PrivateKey.from_private_bytes(_b64decode(private_key_b64))
     return _b64encode(private_key.sign(payload))

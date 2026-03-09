@@ -44,12 +44,13 @@
 - 基于 Git 选择文件，并遵循 `.gitignore`
 - 以结构化 JSON 上传命令
 - 由 `file_package + command` 组成 task
+- 任何已配置好的节点都可以上传文件包、命令、task，并向 Hub 提交运行任务
 - 通过 Hub 把任务投递给指定 `agent_id`
 - Agent 以 pull 模式拉取并执行任务
 - 采集 stdout/stderr
 - 回传 exit code 和最终状态
 - 用 GitHub 存储文件包、命令、task、日志和结果
-- 提供 Hub 和 Agent 的交互式初始化
+- 提供 Hub 和节点的交互式初始化
 
 从实际使用上看，它很适合作为 AI 辅助开发的轻量执行闭环：
 
@@ -77,10 +78,13 @@
 
 ## 运行方式
 
+- 一台机器运行 Hub 服务
+- 所有机器都可以运行 Agent，包括 Hub 所在机器
+- 任何已配置好的节点都可以上传文件包、命令、签名 task，并向 Hub 提交 run
 - Hub 负责保存运行元数据和对象 ID
 - Agent 轮询 Hub 获取任务
 - 真实任务内容存放在 relay 对象存储中
-- 开发机和 Agent 机都使用同一个 `orbit` CLI
+- 所有节点都使用同一个 `orbit` CLI
 - 初始化之后默认使用同一份 TOML 配置
 
 ## 当前后端
@@ -106,8 +110,8 @@
 
 - Python 3.11+
 - 二选一：GitHub CLI (`gh`) + relay 仓库，或 Hugging Face CLI (`hf`) + relay 仓库
-- 如果使用 GitHub 存储：Hub/开发机与 Agent 机器上都已经完成 `gh auth login`
-- 如果使用 Hugging Face 存储：Hub/开发机与 Agent 机器上都已经完成 `hf auth login`
+- 如果使用 GitHub 存储：所有需要通过 relay 上传或执行任务的机器都已经完成 `gh auth login`
+- 如果使用 Hugging Face 存储：所有需要通过 relay 上传或执行任务的机器都已经完成 `hf auth login`
 - 如需代理，可设置 `HTTPS_PROXY`
 
 #### 1) 交互式初始化 Hub 配置
@@ -131,18 +135,20 @@ orbit init hub
 - `ticket_secret`
 - task 签名密钥对
 
+把打印出来的 `api_token`、`ticket_secret` 和 task 签名密钥对分发给所有需要提交任务的节点。
+
 然后启动 Hub：
 
 ```bash
 orbit hub serve
 ```
 
-#### 2) 交互式初始化 Agent 配置
+#### 2) 交互式初始化节点配置
 
-在 Agent 机器上执行：
+在所有既要提交任务、也要作为 Agent 执行任务的机器上执行，包括 Hub 所在机器：
 
 ```bash
-orbit init agent --agent-id agent-a
+orbit init node --agent-id agent-a
 ```
 
 该命令会交互式询问：
@@ -151,7 +157,7 @@ orbit init agent --agent-id agent-a
 - Hub URL
 - Hub `api_token`
 - 共享的 `ticket_secret`
-- task 公钥
+- task 私钥
 - 存储后端类型
 - 对应后端的 relay 配置
 
@@ -161,7 +167,9 @@ orbit init agent --agent-id agent-a
 orbit agent run
 ```
 
-完成这一步后，Hub 和 Agent 后续都可以直接使用默认配置路径运行。
+`orbit init agent` 仍然保留，作为 `orbit init node` 的兼容别名。
+
+完成这一步后，Hub 和所有节点后续都可以直接使用默认配置路径运行。
 
 ### 使用
 
