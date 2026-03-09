@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from mvp_orbit.cli.main import build_parser, main, prepare_args
+from mvp_orbit.cli.main import SetupWizard, build_parser, main, prepare_args
 from mvp_orbit.config import load_config
 from mvp_orbit.core.signing import public_key_from_private_key_b64
 
@@ -116,6 +116,30 @@ def test_init_node_renders_wizard_summary(monkeypatch, tmp_path, capsys):
     output = capsys.readouterr().out
     assert "ORBIT NODE SETUP" in output
     assert "[ Node Ready ]" in output
+
+
+def test_setup_wizard_prompt_normalizes_none_default_for_questionary(monkeypatch):
+    captured: dict[str, str] = {}
+
+    class FakeQuestion:
+        def ask(self) -> str:
+            return "agent-a"
+
+    def fake_text(message: str, *, default: str, **kwargs):
+        captured["message"] = message
+        captured["default"] = default
+        return FakeQuestion()
+
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    monkeypatch.setattr("sys.stdout.isatty", lambda: True)
+    monkeypatch.setenv("TERM", "xterm-256color")
+    monkeypatch.setattr("mvp_orbit.cli.main.questionary.text", fake_text)
+
+    wizard = SetupWizard("title", "subtitle")
+    value = wizard.prompt("Agent ID", None, required=True)
+
+    assert value == "agent-a"
+    assert captured == {"message": "Agent ID", "default": ""}
 
 
 def test_prepare_args_uses_config_defaults(monkeypatch, tmp_path):

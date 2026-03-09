@@ -100,6 +100,10 @@ class SetupWizard:
             if not required:
                 return ""
 
+    @staticmethod
+    def _questionary_default(default: str | None) -> str:
+        return "" if default is None else str(default)
+
     def prompt(
         self,
         label: str,
@@ -118,7 +122,7 @@ class SetupWizard:
             prompt_fn = questionary.password if secret else questionary.text
             question = prompt_fn(
                 label,
-                default=default,
+                default=self._questionary_default(default),
                 qmark="◆",
                 style=self.qstyle,
                 instruction="press Enter to confirm",
@@ -142,7 +146,7 @@ class SetupWizard:
             result = questionary.select(
                 label,
                 choices=options,
-                default=default,
+                default=self._questionary_default(default),
                 qmark="◆",
                 pointer="▸",
                 style=self.qstyle,
