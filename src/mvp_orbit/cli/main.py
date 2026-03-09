@@ -13,7 +13,14 @@ import httpx
 import questionary
 
 from mvp_orbit.cli.package import build_file_package
-from mvp_orbit.config import OrbitConfig, ensure_hub_secrets, load_config, save_config
+from mvp_orbit.config import (
+    OrbitConfig,
+    apply_node_shared_config,
+    encode_node_shared_config,
+    ensure_hub_secrets,
+    load_config,
+    save_config,
+)
 from mvp_orbit.core.canonical import object_id_for_json
 from mvp_orbit.core.models import CommandObject, RunCreateRequest, RunStatus, SignedTaskObject, TaskObject, utc_now
 from mvp_orbit.core.signing import generate_keypair_b64, public_key_from_private_key_b64, sign_payload
@@ -199,6 +206,19 @@ class SetupWizard:
             print(f"  {line}")
         print()
 
+    def key_values(self, items: list[tuple[str, str]]) -> None:
+        if not items:
+            return
+        width = max(len(label) for label, _ in items)
+        for label, value in items:
+            print(f"  {self._muted(label.ljust(width))}  {value}")
+        print()
+
+    def copy_value(self, label: str, value: str) -> None:
+        print(f"  {self._success(label)}")
+        print(f"    {value}")
+        print()
+
 
 def _read_private_key(value: str) -> str:
     maybe_file = Path(value)
@@ -359,6 +379,7 @@ def cmd_init_hub(args: argparse.Namespace) -> int:
 
     ensure_hub_secrets(config)
     saved_path = save_config(config, config_path)
+    shared_config = encode_node_shared_config(config)
 
     wizard.section(
         "Shared Credentials",
@@ -369,16 +390,31 @@ def cmd_init_hub(args: argparse.Namespace) -> int:
         [
             f"Config saved: {saved_path}",
             f"Hub URL: {config.hub.resolved_url()}",
-            "Distribute the printed credentials to every submitting node.",
+            "Recommended: give nodes the ORBIT_NODE_SHARED_CONFIG string and let `orbit init node` import the rest.",
         ],
     )
-    print(f"Wrote Hub config to {saved_path}")
-    print(f"Hub URL: {config.hub.resolved_url()}")
-    print(f"ORBIT_API_TOKEN={config.auth.api_token}")
-    print(f"ORBIT_TICKET_SECRET={config.auth.ticket_secret}")
-    print(f"ORBIT_TASK_PRIVATE_KEY_B64={config.task_signing.private_key_b64}")
-    print(f"ORBIT_TASK_PUBLIC_KEY_B64={config.task_signing.public_key_b64}")
-    print("Distribute the API token, ticket secret, and task keypair to every node that should submit tasks.")
+    wizard.section(
+        "Recommended For Nodes",
+        "Start with this single secret on every node. `orbit init node` can import the Hub URL, relay backend, API token, ticket secret, and task signing key from it.",
+    )
+    wizard.copy_value("ORBIT_NODE_SHARED_CONFIG", shared_config)
+    wizard.note("Paste it directly when `orbit init node` asks, or pass it with `--shared-config`.")
+    wizard.note("Treat this value as a secret. It includes the API token, ticket secret, and task private key.")
+
+    wizard.section(
+        "Detailed Values",
+        "These are the individual values behind the shared config. Keep them only if you need manual setup or inspection.",
+    )
+    wizard.key_values(
+        [
+            ("Config saved", str(saved_path)),
+            ("Hub URL", config.hub.resolved_url()),
+            ("ORBIT_API_TOKEN", str(config.auth.api_token)),
+            ("ORBIT_TICKET_SECRET", str(config.auth.ticket_secret)),
+            ("ORBIT_TASK_PRIVATE_KEY_B64", str(config.task_signing.private_key_b64)),
+            ("ORBIT_TASK_PUBLIC_KEY_B64", str(config.task_signing.public_key_b64)),
+        ]
+    )
     return 0
 
 
@@ -388,6 +424,23 @@ def cmd_init_node(args: argparse.Namespace) -> int:
         "ORBIT NODE SETUP",
         "Configure one machine to submit work through the Hub and execute work as an agent.",
     )
+    shared_config = args.shared_config
+    if wizard.interactive and not shared_config:
+        wizard.section(
+            "Shared Bootstrap",
+            "If you already have the ORBIT_NODE_SHARED_CONFIG string from `orbit init hub`, you can import all shared values in one step.",
+        )
+        if wizard.boolean("Do you have an ORBIT_NODE_SHARED_CONFIG string?", False):
+            shared_config = wizard.prompt(
+                "ORBIT_NODE_SHARED_CONFIG",
+                required=True,
+                hint="Treat this value as a secret. It includes the API token, ticket secret, and task private key.",
+            )
+    if shared_config:
+        try:
+            apply_node_shared_config(config, shared_config)
+        except ValueError as exc:
+            raise SystemExit(f"invalid --shared-config: {exc}") from exc
 
     default_agent_id = args.agent_id or config.agent.id
     wizard.section(
@@ -395,23 +448,31 @@ def cmd_init_node(args: argparse.Namespace) -> int:
         "This node ID is how the Hub targets remote runs. The same machine can both submit tasks and execute them.",
     )
     config.agent.id = wizard.prompt("Agent ID", default_agent_id, required=True)
-    config.hub.url = wizard.prompt("Hub URL", config.hub.resolved_url(), required=True)
-    _prompt_storage_config(config, wizard)
-    wizard.section(
-        "Hub Credentials",
-        "Paste the shared values generated by `orbit init hub`. Nodes use these to submit runs and verify leases.",
-    )
-    config.auth.api_token = wizard.prompt("Hub API token", config.auth.api_token, required=True, secret=True)
-    config.auth.ticket_secret = wizard.prompt("Run ticket secret", config.auth.ticket_secret, required=True, secret=True)
-    config.task_signing.private_key_b64 = _read_private_key(
-        wizard.prompt(
-            "Task private key",
-            config.task_signing.private_key_b64,
-            required=True,
-            hint="You can paste the base64 key directly or enter a path to a file that contains it.",
+
+    if shared_config:
+        wizard.section(
+            "Shared Config",
+            "Imported Hub URL, relay backend, API token, ticket secret, and task signing key from --shared-config.",
         )
-    )
-    config.task_signing.public_key_b64 = public_key_from_private_key_b64(config.task_signing.private_key_b64)
+        wizard.note("Review the saved config if you need to customize shared values for this node.")
+    else:
+        config.hub.url = wizard.prompt("Hub URL", config.hub.resolved_url(), required=True)
+        _prompt_storage_config(config, wizard)
+        wizard.section(
+            "Hub Credentials",
+            "Paste the shared values generated by `orbit init hub`. Nodes use these to submit runs and verify leases.",
+        )
+        config.auth.api_token = wizard.prompt("Hub API token", config.auth.api_token, required=True, secret=True)
+        config.auth.ticket_secret = wizard.prompt("Run ticket secret", config.auth.ticket_secret, required=True, secret=True)
+        config.task_signing.private_key_b64 = _read_private_key(
+            wizard.prompt(
+                "Task private key",
+                config.task_signing.private_key_b64,
+                required=True,
+                hint="You can paste the base64 key directly or enter a path to a file that contains it.",
+            )
+        )
+        config.task_signing.public_key_b64 = public_key_from_private_key_b64(config.task_signing.private_key_b64)
     wizard.section(
         "Runtime",
         "Workspace and polling settings control how the local agent runs jobs after the Hub assigns them.",
@@ -666,9 +727,11 @@ def build_parser() -> argparse.ArgumentParser:
     init_hub.set_defaults(func=cmd_init_hub)
     init_node = init_sub.add_parser("node", help="interactively create/update a node config for submit + agent execution")
     init_node.add_argument("--agent-id", default=None)
+    init_node.add_argument("--shared-config", default=os.getenv("ORBIT_NODE_SHARED_CONFIG"))
     init_node.set_defaults(func=cmd_init_node)
     init_agent = init_sub.add_parser("agent", help="alias for `orbit init node`")
     init_agent.add_argument("--agent-id", default=None)
+    init_agent.add_argument("--shared-config", default=os.getenv("ORBIT_NODE_SHARED_CONFIG"))
     init_agent.set_defaults(func=cmd_init_agent)
 
     package = sub.add_parser("package", help="package object commands")

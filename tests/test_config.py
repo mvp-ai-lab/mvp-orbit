@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from mvp_orbit.cli.main import SetupWizard, build_parser, main, prepare_args
-from mvp_orbit.config import load_config
+from mvp_orbit.config import OrbitConfig, apply_node_shared_config, encode_node_shared_config, ensure_hub_secrets, load_config
 from mvp_orbit.core.signing import public_key_from_private_key_b64
 
 
@@ -44,8 +44,12 @@ def test_init_hub_writes_default_config(monkeypatch, tmp_path, capsys):
     assert "ORBIT HUB SETUP" in output
     assert "[ Hub Ready ]" in output
     assert str(config_path) in output
-    assert "ORBIT_TASK_PRIVATE_KEY_B64=" in output
-    assert "ORBIT_TASK_PUBLIC_KEY_B64=" in output
+    assert "[ Recommended For Nodes ]" in output
+    assert "[ Detailed Values ]" in output
+    assert "ORBIT_TASK_PRIVATE_KEY_B64" in output
+    assert "ORBIT_TASK_PUBLIC_KEY_B64" in output
+    assert "ORBIT_NODE_SHARED_CONFIG" in output
+    assert "Paste it directly when `orbit init node` asks" in output
 
 
 def test_init_node_writes_submitter_and_agent_config(monkeypatch, tmp_path):
@@ -116,6 +120,114 @@ def test_init_node_renders_wizard_summary(monkeypatch, tmp_path, capsys):
     output = capsys.readouterr().out
     assert "ORBIT NODE SETUP" in output
     assert "[ Node Ready ]" in output
+
+
+def test_node_shared_config_round_trip():
+    config = OrbitConfig()
+    config.storage.provider = "github"
+    config.github.owner = "GeoffreyChen777"
+    config.github.repo = "mvp-orbit-relay"
+    config.hub.url = "http://127.0.0.1:10551"
+    ensure_hub_secrets(config)
+
+    shared_config = encode_node_shared_config(config)
+    restored = apply_node_shared_config(OrbitConfig(), shared_config)
+
+    assert restored.storage.provider == "github"
+    assert restored.github.owner == "GeoffreyChen777"
+    assert restored.github.repo == "mvp-orbit-relay"
+    assert restored.hub.url == "http://127.0.0.1:10551"
+    assert restored.auth.api_token == config.auth.api_token
+    assert restored.auth.ticket_secret == config.auth.ticket_secret
+    assert restored.task_signing.private_key_b64 == config.task_signing.private_key_b64
+    assert restored.task_signing.public_key_b64 == config.task_signing.public_key_b64
+
+
+def test_init_node_accepts_shared_config(monkeypatch, tmp_path):
+    config_path = tmp_path / "config.toml"
+    monkeypatch.setenv("ORBIT_CONFIG", str(config_path))
+
+    shared = OrbitConfig()
+    shared.storage.provider = "github"
+    shared.github.owner = "GeoffreyChen777"
+    shared.github.repo = "mvp-orbit-relay"
+    shared.hub.url = "http://127.0.0.1:10551"
+    ensure_hub_secrets(shared)
+    shared_config = encode_node_shared_config(shared)
+
+    answers = iter(
+        [
+            "agent-a",
+            "",
+            "",
+            "",
+        ]
+    )
+    monkeypatch.setattr("builtins.input", lambda _: next(answers))
+
+    try:
+        main(["init", "node", "--shared-config", shared_config])
+    except SystemExit as exc:
+        assert exc.code == 0
+
+    _, config = load_config(config_path)
+    assert config.agent.id == "agent-a"
+    assert config.hub.url == "http://127.0.0.1:10551"
+    assert config.storage.provider == "github"
+    assert config.github.owner == "GeoffreyChen777"
+    assert config.github.repo == "mvp-orbit-relay"
+    assert config.auth.api_token == shared.auth.api_token
+    assert config.auth.ticket_secret == shared.auth.ticket_secret
+    assert config.task_signing.private_key_b64 == shared.task_signing.private_key_b64
+    assert config.task_signing.public_key_b64 == shared.task_signing.public_key_b64
+
+
+def test_init_node_interactive_prompts_for_shared_config(monkeypatch, tmp_path):
+    config_path = tmp_path / "config.toml"
+    monkeypatch.setenv("ORBIT_CONFIG", str(config_path))
+    monkeypatch.setenv("TERM", "xterm-256color")
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    monkeypatch.setattr("sys.stdout.isatty", lambda: True)
+
+    shared = OrbitConfig()
+    shared.storage.provider = "github"
+    shared.github.owner = "GeoffreyChen777"
+    shared.github.repo = "mvp-orbit-relay"
+    shared.hub.url = "http://127.0.0.1:10551"
+    ensure_hub_secrets(shared)
+    shared_config = encode_node_shared_config(shared)
+
+    confirm_calls: list[str] = []
+    text_answers = iter([shared_config, "agent-a", "", "", ""])
+
+    class FakeQuestion:
+        def __init__(self, answer):
+            self.answer = answer
+
+        def ask(self):
+            return self.answer
+
+    def fake_confirm(message: str, **kwargs):
+        confirm_calls.append(message)
+        return FakeQuestion(True)
+
+    def fake_text(message: str, **kwargs):
+        return FakeQuestion(next(text_answers))
+
+    monkeypatch.setattr("mvp_orbit.cli.main.questionary.confirm", fake_confirm)
+    monkeypatch.setattr("mvp_orbit.cli.main.questionary.text", fake_text)
+
+    try:
+        main(["init", "node"])
+    except SystemExit as exc:
+        assert exc.code == 0
+
+    _, config = load_config(config_path)
+    assert confirm_calls == ["Do you have an ORBIT_NODE_SHARED_CONFIG string?"]
+    assert config.agent.id == "agent-a"
+    assert config.hub.url == "http://127.0.0.1:10551"
+    assert config.storage.provider == "github"
+    assert config.auth.api_token == shared.auth.api_token
 
 
 def test_setup_wizard_prompt_normalizes_none_default_for_questionary(monkeypatch):

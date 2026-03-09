@@ -135,8 +135,9 @@ It also generates and stores:
 - `api_token`
 - `ticket_secret`
 - task signing keypair
+- `ORBIT_NODE_SHARED_CONFIG` bootstrap string for nodes
 
-Distribute the printed `api_token`, `ticket_secret`, and task signing keypair to every node that should submit work.
+Distribute either the printed `ORBIT_NODE_SHARED_CONFIG` string or the individual `api_token`, `ticket_secret`, and task signing keypair to every node that should submit work.
 
 Then start the Hub:
 
@@ -152,15 +153,17 @@ Run this on every machine that should both submit work and execute as an Agent, 
 orbit init node --agent-id agent-a
 ```
 
+Or, if you already ran `orbit init hub`, reuse the printed shared string and skip the shared-value prompts:
+
+```bash
+orbit init node --agent-id agent-a --shared-config "$ORBIT_NODE_SHARED_CONFIG"
+```
+
 The command prompts for:
 
 - `agent_id`
-- Hub URL
-- Hub `api_token`
-- shared `ticket_secret`
-- task signing private key
-- storage provider
-- provider-specific relay settings
+- Hub URL, relay settings, and shared credentials if `--shared-config` is not provided
+- only `agent_id` plus local runtime settings if `--shared-config` is provided
 
 Then start the Agent:
 
