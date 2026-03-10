@@ -210,3 +210,41 @@ def test_shell_session_uses_base_workspace_and_emits_output(tmp_path):
         headers={"Authorization": "Bearer api-token"},
     ).json()
     assert any("hello-shell" in event["data"] for event in events["events"])
+
+
+def test_list_shell_sessions_supports_filters(tmp_path):
+    client = _build_client(tmp_path)
+
+    first = client.post(
+        "/api/shells",
+        json={"agent_id": "agent-a"},
+        headers={"Authorization": "Bearer api-token"},
+    ).json()
+    second = client.post(
+        "/api/shells",
+        json={"agent_id": "agent-b"},
+        headers={"Authorization": "Bearer api-token"},
+    ).json()
+
+    client.post(
+        f"/api/shells/{second['session_id']}/complete",
+        json={"status": "closed", "exit_code": 0, "failure_code": None},
+        headers={"Authorization": "Bearer api-token"},
+    )
+
+    listed = client.get("/api/shells", headers={"Authorization": "Bearer api-token"}).json()
+    assert {item["session_id"] for item in listed} == {first["session_id"], second["session_id"]}
+
+    by_agent = client.get(
+        "/api/shells",
+        params={"agent_id": "agent-a"},
+        headers={"Authorization": "Bearer api-token"},
+    ).json()
+    assert [item["session_id"] for item in by_agent] == [first["session_id"]]
+
+    by_status = client.get(
+        "/api/shells",
+        params={"status": "closed"},
+        headers={"Authorization": "Bearer api-token"},
+    ).json()
+    assert [item["session_id"] for item in by_status] == [second["session_id"]]

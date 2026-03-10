@@ -36,6 +36,7 @@ Use `mvp-orbit` as a small remote execution loop over HTTP:
   - `orbit command output --command-id <command_id> --follow`
   - `orbit command cancel --command-id <command_id>`
 - Use `orbit shell start --agent-id <id> [--package-id <pkg>]` for interactive work.
+- Use `orbit shell list [--agent-id <id>] [--status <status>]` when you need to find active or historical shell sessions.
 - Reconnect or stop a shell with:
   - `orbit shell attach --session-id <session_id>`
   - `orbit shell close --session-id <session_id>`

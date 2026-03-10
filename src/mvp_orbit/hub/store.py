@@ -479,6 +479,28 @@ class HubStore:
             return None
         return self._row_to_shell(dict(row))
 
+    def list_shell_sessions(
+        self,
+        *,
+        agent_id: str | None = None,
+        session_status: ShellSessionStatus | None = None,
+    ) -> list[ShellSessionRecord]:
+        query = "SELECT * FROM shell_sessions"
+        clauses: list[str] = []
+        params: list[str] = []
+        if agent_id is not None:
+            clauses.append("agent_id = ?")
+            params.append(agent_id)
+        if session_status is not None:
+            clauses.append("status = ?")
+            params.append(session_status.value)
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY created_at DESC"
+        with self._lock:
+            rows = self._conn.execute(query, params).fetchall()
+        return [self._row_to_shell(dict(row)) for row in rows]
+
     def package_path(self, package_id: str) -> Path:
         return self.packages_root / f"{package_id}.tar.gz"
 

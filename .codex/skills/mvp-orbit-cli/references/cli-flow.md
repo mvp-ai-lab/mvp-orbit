@@ -129,6 +129,8 @@ orbit shell start --agent-id agent-a --package-id <PACKAGE_ID>
 ### Reattach or close
 
 ```bash
+orbit shell list
+orbit shell list --agent-id agent-a
 orbit shell attach --session-id <SESSION_ID>
 orbit shell close --session-id <SESSION_ID>
 ```
@@ -137,6 +139,7 @@ While attached locally:
 
 - `/detach` keeps the remote shell alive and disconnects the local terminal
 - `/close` closes the remote shell
+- `shell start` prints the new `session_id` before attaching
 
 ## Removed legacy flow
 

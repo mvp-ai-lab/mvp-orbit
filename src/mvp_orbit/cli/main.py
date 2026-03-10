@@ -22,7 +22,7 @@ from mvp_orbit.config import (
     load_config,
     save_config,
 )
-from mvp_orbit.core.models import CommandCreateRequest, CommandStatus, ShellSessionCreateRequest
+from mvp_orbit.core.models import CommandCreateRequest, CommandStatus, ShellSessionCreateRequest, ShellSessionStatus
 
 
 class SetupWizard:
@@ -419,7 +419,25 @@ def cmd_shell_start(args: argparse.Namespace) -> int:
     if args.detach or not sys.stdin.isatty():
         print(json.dumps(payload, ensure_ascii=False, indent=2))
         return 0
+    print(f"[orbit] shell session {payload['session_id']}", file=sys.stderr, flush=True)
     _attach_shell(args.hub_url, args.api_token, payload["session_id"], poll_interval_sec=args.poll_interval_sec)
+    return 0
+
+
+def cmd_shell_list(args: argparse.Namespace) -> int:
+    params: dict[str, str] = {}
+    if args.agent_id:
+        params["agent_id"] = args.agent_id
+    if args.status:
+        params["status"] = args.status
+    with httpx.Client(timeout=20) as client:
+        response = client.get(
+            f"{args.hub_url}/api/shells",
+            headers=_headers(args.api_token),
+            params=params or None,
+        )
+        response.raise_for_status()
+        print(json.dumps(response.json(), ensure_ascii=False, indent=2))
     return 0
 
 
@@ -580,6 +598,13 @@ def build_parser() -> argparse.ArgumentParser:
     shell_start.add_argument("--detach", action="store_true")
     shell_start.set_defaults(func=cmd_shell_start)
 
+    shell_list = shell_sub.add_parser("list", help="list remote shell sessions")
+    shell_list.add_argument("--hub-url", default=None)
+    shell_list.add_argument("--api-token", default=os.getenv("ORBIT_API_TOKEN"))
+    shell_list.add_argument("--agent-id", default=None)
+    shell_list.add_argument("--status", choices=[status.value for status in ShellSessionStatus])
+    shell_list.set_defaults(func=cmd_shell_list)
+
     shell_attach = shell_sub.add_parser("attach", help="attach to a remote shell session")
     shell_attach.add_argument("--hub-url", default=None)
     shell_attach.add_argument("--api-token", default=os.getenv("ORBIT_API_TOKEN"))
@@ -625,7 +650,7 @@ def prepare_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> a
         _validate_required(parser, args, "hub_url")
     if args.command == "shell" and args.shell_command == "start":
         _validate_required(parser, args, "hub_url", "agent_id")
-    if args.command == "shell" and args.shell_command in {"attach", "close"}:
+    if args.command == "shell" and args.shell_command in {"list", "attach", "close"}:
         _validate_required(parser, args, "hub_url")
     return args
 

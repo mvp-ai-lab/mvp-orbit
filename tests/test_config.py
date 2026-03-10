@@ -104,3 +104,15 @@ id = "agent-a"
     )
     assert package_args.hub_url == "http://127.0.0.1:10551"
     assert package_args.api_token == "api-token"
+
+    shell_list_args = prepare_args(
+        parser,
+        parser.parse_args(
+            [
+                "shell",
+                "list",
+            ]
+        ),
+    )
+    assert shell_list_args.hub_url == "http://127.0.0.1:10551"
+    assert shell_list_args.api_token == "api-token"

@@ -147,6 +147,8 @@ orbit shell start --agent-id agent-a --package-id <PACKAGE_ID>
 重连或关闭：
 
 ```bash
+orbit shell list
+orbit shell list --agent-id agent-a
 orbit shell attach --session-id <SESSION_ID>
 orbit shell close --session-id <SESSION_ID>
 ```
@@ -155,6 +157,7 @@ orbit shell close --session-id <SESSION_ID>
 
 - `/detach` 会保留远端 shell，只断开当前本地连接
 - `/close` 会关闭远端 shell
+- `shell start` 在 attach 前会先打印新的 `session_id`，方便后续重连或关闭
 
 ## 配置
 

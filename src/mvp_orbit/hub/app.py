@@ -20,6 +20,7 @@ from mvp_orbit.core.models import (
     ShellInputRequest,
     ShellSessionCreateRequest,
     ShellSessionRecord,
+    ShellSessionStatus,
     default_command_id,
     default_shell_session_id,
 )
@@ -139,6 +140,13 @@ def create_app(*, store: HubStore | None = None, api_token: str | None = None) -
     def create_shell_session(request: ShellSessionCreateRequest) -> ShellSessionRecord:
         cwd_root = "." if request.package_id is None else f".orbit/packages/{request.package_id}"
         return store.create_shell_session(default_shell_session_id(), request, cwd_root=cwd_root)
+
+    @app.get("/api/shells", response_model=list[ShellSessionRecord], dependencies=[Depends(require_auth)])
+    def list_shell_sessions(
+        agent_id: str | None = Query(default=None),
+        session_status: ShellSessionStatus | None = Query(default=None, alias="status"),
+    ) -> list[ShellSessionRecord]:
+        return store.list_shell_sessions(agent_id=agent_id, session_status=session_status)
 
     @app.get("/api/shells/{session_id}", response_model=ShellSessionRecord, dependencies=[Depends(require_auth)])
     def get_shell_session(session_id: str) -> ShellSessionRecord:
