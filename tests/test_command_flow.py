@@ -5,6 +5,7 @@ import sys
 import threading
 import time
 
+import httpx
 from fastapi.testclient import TestClient
 
 from mvp_orbit.agent.runtime import AgentRuntime
@@ -99,6 +100,47 @@ def test_agent_logs_package_download_and_command_execution(tmp_path, caplog):
     assert f"prepared package {package_id}" in messages
     assert f"starting command {command_id}" in messages
     assert f"finished command {command_id} status=succeeded exit_code=0" in messages
+
+
+def test_command_output_post_403_does_not_break_command(tmp_path, caplog):
+    caplog.set_level(logging.WARNING)
+    client = _build_client(tmp_path)
+
+    created = client.post(
+        "/api/commands",
+        json={
+            "agent_id": "agent-a",
+            "argv": [sys.executable, "-c", "print('hello-output')"],
+            "working_dir": ".",
+            "timeout_sec": 30,
+            "env_patch": {},
+        },
+        headers={"Authorization": "Bearer api-token"},
+    )
+    command_id = created.json()["command_id"]
+
+    runtime = AgentRuntime(agent_id="agent-a", base_workspace=tmp_path / "workspace", heartbeat_interval_sec=0.01)
+    service = AgentService(agent_id="agent-a", hub_url=str(client.base_url), runtime=runtime, api_token="api-token")
+
+    original_post = client.post
+
+    def flaky_post(url, *args, **kwargs):
+        if str(url).endswith(f"/api/commands/{command_id}/output"):
+            request = httpx.Request("POST", str(url))
+            return httpx.Response(status_code=403, request=request)
+        return original_post(url, *args, **kwargs)
+
+    client.post = flaky_post
+    try:
+        assert service.poll_once(client=client) == "succeeded"
+    finally:
+        client.post = original_post
+
+    status = client.get(f"/api/commands/{command_id}", headers={"Authorization": "Bearer api-token"}).json()
+    output = client.get(f"/api/commands/{command_id}/output", headers={"Authorization": "Bearer api-token"}).json()
+    assert status["status"] == "succeeded"
+    assert output["stdout"] == ""
+    assert f"failed to append command {command_id} stdout output" in "\n".join(record.getMessage() for record in caplog.records)
 
 
 def test_end_to_end_command_without_package_uses_base_workspace(tmp_path):

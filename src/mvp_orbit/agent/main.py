@@ -35,8 +35,8 @@ def main() -> None:
         agent_id=agent_id,
         base_workspace=base_workspace,
         heartbeat_interval_sec=float(os.getenv("ORBIT_AGENT_HEARTBEAT_SEC", "5")),
-        command_output_chunk_bytes=int(os.getenv("ORBIT_COMMAND_OUTPUT_CHUNK_BYTES", "16384")),
-        command_output_flush_interval_sec=float(os.getenv("ORBIT_COMMAND_OUTPUT_FLUSH_SEC", "10")),
+        command_output_chunk_bytes=int(os.getenv("ORBIT_COMMAND_OUTPUT_CHUNK_BYTES", "163840")),
+        command_output_flush_interval_sec=float(os.getenv("ORBIT_COMMAND_OUTPUT_FLUSH_SEC", "30")),
     )
     service = AgentService(
         agent_id=agent_id,

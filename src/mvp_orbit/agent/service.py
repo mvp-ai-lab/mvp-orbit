@@ -123,12 +123,21 @@ class AgentService:
 
     def _append_command_output(self, client: httpx.Client, command_id: str, stream: str, data: str) -> None:
         request = CommandOutputAppendRequest(stream=stream, data=data)
-        response = client.post(
-            f"{self.hub_url}/api/commands/{command_id}/output",
-            headers=self._headers(),
-            json=request.model_dump(mode="json"),
-        )
-        response.raise_for_status()
+        try:
+            response = client.post(
+                f"{self.hub_url}/api/commands/{command_id}/output",
+                headers=self._headers(),
+                json=request.model_dump(mode="json"),
+            )
+            response.raise_for_status()
+        except (httpx.RequestError, httpx.HTTPStatusError) as exc:
+            logger.warning(
+                "agent %s failed to append command %s %s output: %s",
+                self.agent_id,
+                command_id,
+                stream,
+                exc,
+            )
 
     def _command_heartbeat(self, client: httpx.Client, command_id: str) -> bool:
         response = client.post(f"{self.hub_url}/api/commands/{command_id}/heartbeat", headers=self._headers())
@@ -161,12 +170,21 @@ class AgentService:
 
     def _append_shell_event(self, client: httpx.Client, session_id: str, stream: str, data: str) -> None:
         request = ShellEventAppendRequest(stream=stream, data=data)
-        response = client.post(
-            f"{self.hub_url}/api/shells/{session_id}/events",
-            headers=self._headers(),
-            json=request.model_dump(mode="json"),
-        )
-        response.raise_for_status()
+        try:
+            response = client.post(
+                f"{self.hub_url}/api/shells/{session_id}/events",
+                headers=self._headers(),
+                json=request.model_dump(mode="json"),
+            )
+            response.raise_for_status()
+        except (httpx.RequestError, httpx.HTTPStatusError) as exc:
+            logger.warning(
+                "agent %s failed to append shell session %s %s event: %s",
+                self.agent_id,
+                session_id,
+                stream,
+                exc,
+            )
 
     def _shell_heartbeat(self, client: httpx.Client, session_id: str) -> bool:
         response = client.post(f"{self.hub_url}/api/shells/{session_id}/heartbeat", headers=self._headers())
