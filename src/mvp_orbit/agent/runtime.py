@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import io
+import logging
 import os
+import shlex
 import shutil
 import subprocess
 import tarfile
@@ -18,6 +20,8 @@ from mvp_orbit.core.models import (
     ShellSessionLease,
     ShellSessionStatus,
 )
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -60,6 +64,14 @@ class AgentRuntime:
         workspace = self._command_workspace(lease, fetch_package)
         cwd = self._resolve_working_dir(workspace, lease.working_dir)
         env = self._merged_env(lease.env_patch)
+        logger.info(
+            "agent %s starting command %s in %s package_id=%s argv=%s",
+            self.agent_id,
+            lease.command_id,
+            cwd,
+            lease.package_id or "-",
+            shlex.join(lease.argv),
+        )
 
         proc = subprocess.Popen(
             lease.argv,
@@ -117,10 +129,19 @@ class AgentRuntime:
         stderr_thread.join(timeout=2)
 
         if canceled:
+            logger.info("agent %s canceled command %s exit_code=%s", self.agent_id, lease.command_id, return_code)
             return CommandExecutionOutcome(status=CommandStatus.CANCELED, exit_code=return_code, failure_code="canceled")
         if timed_out:
+            logger.warning("agent %s timed out command %s", self.agent_id, lease.command_id)
             return CommandExecutionOutcome(status=CommandStatus.FAILED, exit_code=return_code, failure_code="timeout")
         status = CommandStatus.SUCCEEDED if return_code == 0 else CommandStatus.FAILED
+        logger.info(
+            "agent %s finished command %s status=%s exit_code=%s",
+            self.agent_id,
+            lease.command_id,
+            status.value,
+            return_code,
+        )
         return CommandExecutionOutcome(status=status, exit_code=return_code)
 
     def handle_shell_session(
@@ -134,6 +155,13 @@ class AgentRuntime:
         should_close: Callable[[], bool],
     ) -> ShellExecutionOutcome:
         workspace = self._shell_workspace(lease, fetch_package)
+        logger.info(
+            "agent %s starting shell session %s in %s package_id=%s",
+            self.agent_id,
+            lease.session_id,
+            workspace,
+            lease.package_id or "-",
+        )
         proc = subprocess.Popen(
             self._shell_argv(),
             cwd=str(workspace),
@@ -171,6 +199,13 @@ class AgentRuntime:
                 next_heartbeat = time.monotonic() + self.heartbeat_interval_sec
 
             for seq, data in get_inputs(next_input_seq):
+                logger.info(
+                    "agent %s shell session %s input seq=%s command=%r",
+                    self.agent_id,
+                    lease.session_id,
+                    seq,
+                    self._input_preview(data),
+                )
                 proc.stdin.write(data)
                 proc.stdin.flush()
                 next_input_seq = seq
@@ -180,9 +215,17 @@ class AgentRuntime:
                 stdout_thread.join(timeout=2)
                 stderr_thread.join(timeout=2)
                 status = ShellSessionStatus.CLOSED if polled == 0 else ShellSessionStatus.FAILED
+                logger.info(
+                    "agent %s finished shell session %s status=%s exit_code=%s",
+                    self.agent_id,
+                    lease.session_id,
+                    status.value,
+                    polled,
+                )
                 return ShellExecutionOutcome(status=status, exit_code=polled)
 
             if should_close():
+                logger.info("agent %s closing shell session %s on request", self.agent_id, lease.session_id)
                 proc.stdin.write("exit\n")
                 proc.stdin.flush()
                 try:
@@ -193,6 +236,13 @@ class AgentRuntime:
                 stderr_thread.join(timeout=2)
                 status = ShellSessionStatus.CLOSED if return_code == 0 else ShellSessionStatus.FAILED
                 failure = None if return_code == 0 else "closed"
+                logger.info(
+                    "agent %s closed shell session %s status=%s exit_code=%s",
+                    self.agent_id,
+                    lease.session_id,
+                    status.value,
+                    return_code,
+                )
                 return ShellExecutionOutcome(status=status, exit_code=return_code, failure_code=failure)
             time.sleep(0.2)
 
@@ -210,8 +260,10 @@ class AgentRuntime:
         workspace = self.packages_root / package_id
         marker = workspace / ".orbit-ready"
         if marker.exists():
+            logger.info("agent %s reusing package %s in %s", self.agent_id, package_id, workspace)
             return workspace
 
+        logger.info("agent %s downloading package %s into %s", self.agent_id, package_id, workspace)
         package_bytes = fetch_package(package_id)
         require_matching_object_id(package_id, package_bytes)
         if workspace.exists():
@@ -220,6 +272,7 @@ class AgentRuntime:
         with tarfile.open(fileobj=io.BytesIO(package_bytes), mode="r:gz") as tar:
             self._extract_safely(tar, workspace)
         marker.write_text("ready\n", encoding="utf-8")
+        logger.info("agent %s prepared package %s in %s", self.agent_id, package_id, workspace)
         return workspace
 
     def _resolve_working_dir(self, workspace: Path, working_dir: str) -> Path:
@@ -260,6 +313,15 @@ class AgentRuntime:
         if Path("/bin/bash").exists():
             return ["/bin/bash", "-i"]
         return ["/bin/sh", "-i"]
+
+    @staticmethod
+    def _input_preview(data: str) -> str:
+        preview = data.strip()
+        if not preview:
+            return "<empty>"
+        if len(preview) > 120:
+            return f"{preview[:117]}..."
+        return preview
 
     @staticmethod
     def _extract_safely(tar: tarfile.TarFile, destination: Path) -> None:

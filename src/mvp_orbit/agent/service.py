@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import time
 from dataclasses import dataclass
 
@@ -14,6 +15,8 @@ from mvp_orbit.core.models import (
     ShellEventAppendRequest,
     ShellSessionLease,
 )
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -60,6 +63,12 @@ class AgentService:
             return "idle"
         response.raise_for_status()
         lease = CommandLease.model_validate(response.json())
+        logger.info(
+            "agent %s leased command %s package_id=%s",
+            self.agent_id,
+            lease.command_id,
+            lease.package_id or "-",
+        )
         outcome = self.runtime.handle_command(
             lease,
             fetch_package=lambda package_id: self._fetch_package(client, package_id),
@@ -67,6 +76,13 @@ class AgentService:
             heartbeat=lambda: self._command_heartbeat(client, lease.command_id),
         )
         self._complete_command(client, lease.command_id, outcome)
+        logger.info(
+            "agent %s reported command %s status=%s exit_code=%s",
+            self.agent_id,
+            lease.command_id,
+            outcome.status.value,
+            outcome.exit_code,
+        )
         return outcome.status.value
 
     def _poll_shell_once(self, client: httpx.Client) -> str:
@@ -75,6 +91,12 @@ class AgentService:
             return "idle"
         response.raise_for_status()
         lease = ShellSessionLease.model_validate(response.json())
+        logger.info(
+            "agent %s leased shell session %s package_id=%s",
+            self.agent_id,
+            lease.session_id,
+            lease.package_id or "-",
+        )
         outcome = self.runtime.handle_shell_session(
             lease,
             fetch_package=lambda package_id: self._fetch_package(client, package_id),
@@ -84,9 +106,17 @@ class AgentService:
             should_close=lambda: self._shell_should_close(client, lease.session_id),
         )
         self._complete_shell(client, lease.session_id, outcome)
+        logger.info(
+            "agent %s reported shell session %s status=%s exit_code=%s",
+            self.agent_id,
+            lease.session_id,
+            outcome.status.value,
+            outcome.exit_code,
+        )
         return outcome.status.value
 
     def _fetch_package(self, client: httpx.Client, package_id: str) -> bytes:
+        logger.info("agent %s requesting package %s from hub", self.agent_id, package_id)
         response = client.get(f"{self.hub_url}/api/packages/{package_id}", headers=self._headers())
         response.raise_for_status()
         return response.content

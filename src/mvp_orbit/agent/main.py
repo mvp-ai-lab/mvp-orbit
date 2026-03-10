@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 from pathlib import Path
 
@@ -17,12 +18,18 @@ def _required(name: str, default: str | None = None) -> str:
 def main() -> None:
     agent_id = _required("ORBIT_AGENT_ID")
     hub_url = _required("ORBIT_HUB_URL")
+    logging.basicConfig(
+        level=getattr(logging, os.getenv("ORBIT_LOG_LEVEL", "INFO").upper(), logging.INFO),
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
     workspace_root = os.getenv("ORBIT_WORKSPACE_ROOT")
     if workspace_root:
         root = Path(workspace_root).expanduser().resolve()
         root.mkdir(parents=True, exist_ok=True)
         os.chdir(root)
     base_workspace = Path.cwd()
+    logger = logging.getLogger(__name__)
+    logger.info("starting agent %s hub=%s workspace=%s", agent_id, hub_url, base_workspace)
 
     runtime = AgentRuntime(
         agent_id=agent_id,
