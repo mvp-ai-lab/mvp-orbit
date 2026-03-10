@@ -111,6 +111,20 @@ orbit command exec \
   bash -lc 'pwd && ls'
 ```
 
+### Execute a compound shell command
+
+```bash
+orbit command exec \
+  --agent-id agent-a \
+  --shell \
+  "cd /cache/models/ && HF_TOKEN=hf_xxx hf download repo --local-dir model-dir"
+```
+
+Notes:
+
+- If your remote command contains `cd`, `&&`, pipes, redirects, or inline env assignments, send it as one quoted string.
+- Unquoted `&&` is consumed by your local shell before `orbit` starts, so the latter half would run locally.
+
 ### Submit without waiting
 
 ```bash

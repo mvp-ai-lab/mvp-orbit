@@ -10,6 +10,7 @@ from fastapi.testclient import TestClient
 from mvp_orbit.agent.runtime import AgentRuntime
 from mvp_orbit.agent.service import AgentService
 from mvp_orbit.cli.package import build_file_package
+from mvp_orbit.core.models import CommandLease, CommandStatus
 from mvp_orbit.hub.app import create_app
 from mvp_orbit.hub.store import HubStore
 
@@ -126,6 +127,36 @@ def test_end_to_end_command_without_package_uses_base_workspace(tmp_path):
 
     output = client.get(f"/api/commands/{command_id}/output", headers={"Authorization": "Bearer api-token"}).json()
     assert "base-workspace" in output["stdout"]
+
+
+def test_command_output_is_chunked_before_append(tmp_path):
+    runtime = AgentRuntime(
+        agent_id="agent-a",
+        base_workspace=tmp_path / "workspace",
+        heartbeat_interval_sec=0.01,
+        command_output_chunk_bytes=1_000_000,
+        command_output_flush_interval_sec=60.0,
+    )
+    lease = CommandLease(
+        command_id="cmd-test",
+        agent_id="agent-a",
+        package_id=None,
+        argv=[sys.executable, "-c", "print('a'); print('b'); print('c')"],
+        env_patch={},
+        timeout_sec=30,
+        working_dir=".",
+    )
+    appended: list[tuple[str, str]] = []
+
+    outcome = runtime.handle_command(
+        lease,
+        fetch_package=lambda _: b"",
+        append_output=lambda stream, data: appended.append((stream, data)),
+        heartbeat=lambda: False,
+    )
+
+    assert outcome.status == CommandStatus.SUCCEEDED
+    assert [(stream, data) for stream, data in appended if stream == "stdout"] == [("stdout", "a\nb\nc\n")]
 
 
 def test_agent_logs_shell_session_inputs(tmp_path, caplog):

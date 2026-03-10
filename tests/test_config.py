@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from mvp_orbit.cli.main import build_parser, main, prepare_args
+from argparse import Namespace
+
+from mvp_orbit.cli.main import _command_create_request, build_parser, main, prepare_args
 from mvp_orbit.config import OrbitConfig, apply_node_shared_config, encode_node_shared_config, ensure_hub_token, load_config
 
 
@@ -116,3 +118,37 @@ id = "agent-a"
     )
     assert shell_list_args.hub_url == "http://127.0.0.1:10551"
     assert shell_list_args.api_token == "api-token"
+
+
+def test_command_create_request_auto_wraps_single_shell_string():
+    request = _command_create_request(
+        Namespace(
+            agent_id="agent-a",
+            package_id=None,
+            command_argv=["cd /cache/models/ && HF_TOKEN=token hf download repo --local-dir out"],
+            env_file=None,
+            timeout_sec=3600,
+            working_dir=".",
+            shell=False,
+        )
+    )
+    assert request.argv == [
+        "/bin/sh",
+        "-lc",
+        "cd /cache/models/ && HF_TOKEN=token hf download repo --local-dir out",
+    ]
+
+
+def test_command_create_request_supports_explicit_shell_mode():
+    request = _command_create_request(
+        Namespace(
+            agent_id="agent-a",
+            package_id=None,
+            command_argv=["cd", "/cache/models/", "&&", "echo", "ok"],
+            env_file=None,
+            timeout_sec=3600,
+            working_dir=".",
+            shell=True,
+        )
+    )
+    assert request.argv == ["/bin/sh", "-lc", "cd /cache/models/ && echo ok"]

@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import sys
 import textwrap
@@ -23,6 +24,8 @@ from mvp_orbit.config import (
     save_config,
 )
 from mvp_orbit.core.models import CommandCreateRequest, CommandStatus, ShellSessionCreateRequest, ShellSessionStatus
+
+_SHELL_META_PATTERN = re.compile(r"(?:&&|\|\||[|;<>()$`\n])")
 
 
 class SetupWizard:
@@ -325,6 +328,10 @@ def _command_create_request(args: argparse.Namespace) -> CommandCreateRequest:
     argv = list(args.command_argv or [])
     if argv and argv[0] == "--":
         argv = argv[1:]
+    if getattr(args, "shell", False):
+        argv = _shell_wrapped_argv(" ".join(argv))
+    elif len(argv) == 1 and _looks_like_shell_command(argv[0]):
+        argv = _shell_wrapped_argv(argv[0])
     return CommandCreateRequest(
         agent_id=args.agent_id,
         package_id=args.package_id,
@@ -333,6 +340,14 @@ def _command_create_request(args: argparse.Namespace) -> CommandCreateRequest:
         timeout_sec=args.timeout_sec,
         working_dir=args.working_dir,
     )
+
+
+def _looks_like_shell_command(value: str) -> bool:
+    return " " in value or bool(_SHELL_META_PATTERN.search(value))
+
+
+def _shell_wrapped_argv(command: str) -> list[str]:
+    return ["/bin/sh", "-lc", command]
 
 
 def cmd_command_exec(args: argparse.Namespace) -> int:
@@ -564,6 +579,7 @@ def build_parser() -> argparse.ArgumentParser:
     command_exec.add_argument("--env-file", default=None)
     command_exec.add_argument("--poll-interval-sec", type=float, default=0.5)
     command_exec.add_argument("--detach", action="store_true")
+    command_exec.add_argument("--shell", action="store_true", help="run the trailing command through /bin/sh -lc on the agent")
     command_exec.add_argument("command_argv", nargs=argparse.REMAINDER)
     command_exec.set_defaults(func=cmd_command_exec)
 

@@ -111,6 +111,20 @@ orbit command exec \
   bash -lc 'pwd && ls'
 ```
 
+### 执行复合 shell 命令
+
+```bash
+orbit command exec \
+  --agent-id agent-a \
+  --shell \
+  "cd /cache/models/ && HF_TOKEN=hf_xxx hf download repo --local-dir model-dir"
+```
+
+说明：
+
+- 如果远端命令里包含 `cd`、`&&`、管道、重定向或内联环境变量，请把整条命令作为一个带引号的字符串传入。
+- 不带引号的 `&&` 会先被你本地 shell 吃掉，所以后半段会在本机执行。
+
 ### 只提交，不等待
 
 ```bash

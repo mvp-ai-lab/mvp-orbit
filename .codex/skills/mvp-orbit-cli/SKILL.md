@@ -29,6 +29,7 @@ Use `mvp-orbit` as a small remote execution loop over HTTP:
 
 - Upload a file package with `orbit package upload --source-dir <dir>` when the remote command depends on local source files.
 - Execute batch work with `orbit command exec --agent-id <id> [--package-id <pkg>] ...`.
+- Use `orbit command exec --shell "..."` when the remote command needs shell features such as `cd`, `&&`, pipes, redirects, or inline env assignments.
 - Use `--detach` when you want a background command and a returned `command_id`.
 - Inspect a detached command with:
   - `orbit command status --command-id <command_id>`

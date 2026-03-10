@@ -38,6 +38,58 @@ class ShellExecutionOutcome:
     failure_code: str | None = None
 
 
+class _ChunkedOutputForwarder:
+    def __init__(
+        self,
+        callback: Callable[[str, str], None],
+        *,
+        flush_bytes: int,
+        flush_interval_sec: float,
+    ) -> None:
+        self._callback = callback
+        self._flush_bytes = max(1, flush_bytes)
+        self._flush_interval_sec = max(0.01, flush_interval_sec)
+        self._buffers = {"stdout": [], "stderr": []}
+        self._sizes = {"stdout": 0, "stderr": 0}
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._flush_loop, daemon=True)
+        self._thread.start()
+
+    def write(self, stream: str, data: str) -> None:
+        payload: str | None = None
+        with self._lock:
+            self._buffers[stream].append(data)
+            self._sizes[stream] += len(data)
+            if self._sizes[stream] >= self._flush_bytes:
+                payload = "".join(self._buffers[stream])
+                self._buffers[stream] = []
+                self._sizes[stream] = 0
+        if payload:
+            self._callback(stream, payload)
+
+    def close(self) -> None:
+        self._stop.set()
+        self._thread.join(timeout=1)
+        self.flush_all()
+
+    def flush_all(self) -> None:
+        pending: list[tuple[str, str]] = []
+        with self._lock:
+            for stream in ("stdout", "stderr"):
+                if not self._buffers[stream]:
+                    continue
+                pending.append((stream, "".join(self._buffers[stream])))
+                self._buffers[stream] = []
+                self._sizes[stream] = 0
+        for stream, payload in pending:
+            self._callback(stream, payload)
+
+    def _flush_loop(self) -> None:
+        while not self._stop.wait(self._flush_interval_sec):
+            self.flush_all()
+
+
 class AgentRuntime:
     def __init__(
         self,
@@ -45,6 +97,8 @@ class AgentRuntime:
         agent_id: str,
         base_workspace: str | Path,
         heartbeat_interval_sec: float = 5.0,
+        command_output_chunk_bytes: int = 16384,
+        command_output_flush_interval_sec: float = 10.0,
     ) -> None:
         self.agent_id = agent_id
         self.base_workspace = Path(base_workspace).resolve()
@@ -52,6 +106,8 @@ class AgentRuntime:
         self.packages_root = self.base_workspace / ".orbit" / "packages"
         self.packages_root.mkdir(parents=True, exist_ok=True)
         self.heartbeat_interval_sec = heartbeat_interval_sec
+        self.command_output_chunk_bytes = command_output_chunk_bytes
+        self.command_output_flush_interval_sec = command_output_flush_interval_sec
 
     def handle_command(
         self,
@@ -86,15 +142,20 @@ class AgentRuntime:
         )
         assert proc.stdout is not None
         assert proc.stderr is not None
+        output_forwarder = _ChunkedOutputForwarder(
+            append_output,
+            flush_bytes=self.command_output_chunk_bytes,
+            flush_interval_sec=self.command_output_flush_interval_sec,
+        )
 
         stdout_thread = threading.Thread(
             target=self._stream_reader,
-            args=(proc.stdout, "stdout", append_output),
+            args=(proc.stdout, "stdout", output_forwarder.write),
             daemon=True,
         )
         stderr_thread = threading.Thread(
             target=self._stream_reader,
-            args=(proc.stderr, "stderr", append_output),
+            args=(proc.stderr, "stderr", output_forwarder.write),
             daemon=True,
         )
         stdout_thread.start()
@@ -127,6 +188,7 @@ class AgentRuntime:
 
         stdout_thread.join(timeout=2)
         stderr_thread.join(timeout=2)
+        output_forwarder.close()
 
         if canceled:
             logger.info("agent %s canceled command %s exit_code=%s", self.agent_id, lease.command_id, return_code)
