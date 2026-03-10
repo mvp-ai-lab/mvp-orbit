@@ -1,65 +1,67 @@
 ---
 name: mvp-orbit-cli
-description: Operate the mvp-orbit CLI for remote debug workflows in this repository. Use when Codex needs to initialize Hub or Agent config, upload a file package, upload a command, create a task, submit a run to an agent, or fetch status, logs, and results from mvp-orbit.
+description: Operate the mvp-orbit CLI for the current pure HTTP Hub/Agent workflow. Use when Codex needs to initialize Hub or Agent config, upload a file package, execute a command on an agent, inspect command status or output, or open and manage a remote shell session.
 ---
 
 # mvp-orbit CLI
 
-Use `mvp-orbit` as a small remote execution loop:
+Use `mvp-orbit` as a small remote execution loop over HTTP:
 
-1. upload files as a package
-2. upload a command JSON
-3. create a task from `package_id + command_id`
-4. submit the task to a target `agent_id`
-5. read run status, logs, and result
-6. cancel the run if it should stop early
+1. initialize the Hub and Agent
+2. upload files as a package when needed
+3. execute a command on a target `agent_id`
+4. inspect command status or output when running detached
+5. open a persistent remote shell when interactive iteration is needed
 
 ## Workflow
 
 ### 1) Verify configuration first
 
 - Assume `orbit` reads the default config file at `~/.config/mvp-orbit/config.toml` unless `--config` or `ORBIT_CONFIG` is set.
-- If the user has not initialized the machine yet, use:
+- If the machine has not been initialized yet, use:
   - `orbit init hub`
+  - `orbit init node --agent-id <agent_id>`
   - `orbit init agent --agent-id <agent_id>`
-- If `gh` operations fail, check that `gh auth login` has already been completed on that machine.
+- `orbit init hub` prints the Hub URL, API token, and `ORBIT_NODE_SHARED_CONFIG`.
+- `orbit init node` can consume that shared string with `--shared-config`.
 
-### 2) Create runnable objects in order
+### 2) Use only the current execution primitives
 
-- Upload the file package first.
-- Upload the command JSON second.
-- Create the task third.
-- Submit the task last.
+- Upload a file package with `orbit package upload --source-dir <dir>` when the remote command depends on local source files.
+- Execute batch work with `orbit command exec --agent-id <id> [--package-id <pkg>] ...`.
+- Use `--detach` when you want a background command and a returned `command_id`.
+- Inspect a detached command with:
+  - `orbit command status --command-id <command_id>`
+  - `orbit command output --command-id <command_id>`
+  - `orbit command output --command-id <command_id> --follow`
+  - `orbit command cancel --command-id <command_id>`
+- Use `orbit shell start --agent-id <id> [--package-id <pkg>]` for interactive work.
+- Reconnect or stop a shell with:
+  - `orbit shell attach --session-id <session_id>`
+  - `orbit shell close --session-id <session_id>`
 
-Always parse the JSON output of each CLI command and feed the returned IDs into the next step. Do not scrape IDs from prose.
+### 3) Respect current workspace semantics
 
-### 3) Submit only `task_id`
+- The Agent startup directory is the base workspace.
+- Commands without `package_id` run directly in the base workspace.
+- Commands with `package_id` run in a package-specific subdirectory under the base workspace.
+- Shell sessions start in the base workspace by default, or in the package workspace when `package_id` is provided.
+- Keep `working_dir` relative to the command or shell workspace root.
 
-- `orbit run submit` only needs `--agent-id` and `--task-id`.
-- Do not pass `package_id` or `command_id` to the Hub.
-- The Agent expands the task object itself and fetches package and command from storage.
+### 4) Prefer direct command execution over legacy object workflows
 
-### 4) Inspect execution through run APIs
-
-- Use `orbit run status --run-id <run_id>` for current state.
-- Prefer `orbit run logs --run-id <run_id> --follow` when monitoring an active run.
-- Use `orbit run logs --run-id <run_id>` to fetch collected stdout/stderr when you need a point-in-time snapshot or after the run reaches a terminal state.
-- Use `orbit run result --run-id <run_id>` to fetch the final result object.
-- Use `orbit run cancel --run-id <run_id>` to stop a queued or running task.
-- Use `orbit relay clean --yes` only when the user explicitly wants to remove all mvp-orbit managed content from the relay repository.
-- Treat `queued` and `running` as non-terminal.
-- Treat `succeeded`, `failed`, `rejected`, and `canceled` as terminal.
-- Assume the Agent uploads log chunks every 10 seconds by default, or earlier when buffered output exceeds 16 KiB.
+- Do not create command JSON files unless the user explicitly needs one for another purpose.
+- Do not use any legacy object workflow built around uploaded command objects, task objects, run polling, or external object storage.
+- Do not assume any external storage service is part of the system.
 
 ## Working rules
 
-- Prefer `orbit package upload --source-dir <dir>` from the repository root or task root the user wants to send.
+- Prefer `orbit package upload --source-dir <dir>` from the project root the user wants to send.
 - Remember that package upload is Git-aware and respects `.gitignore` when the source directory is inside a Git repository.
-- Build command objects as structured JSON with `argv` rather than shell strings when possible.
-- Keep `working_dir` relative to the package root.
-- Use a temporary `command.json` file when you need to synthesize a one-off command.
-- Prefer a streaming-log workflow for active runs: submit, follow logs, then fetch final status/result when the run terminates.
-- When reporting results back to the user, include `run_id`, final status, exit code, and the important log lines.
+- Prefer `orbit command exec` directly for one-off remote execution.
+- Prefer `orbit command exec --detach` followed by `status` or `output` when the command needs to run in the background.
+- Prefer `orbit shell start` only when the task is truly interactive or stateful across multiple commands.
+- When reporting results back to the user, include `command_id` or `session_id`, the current status, the exit code when available, and the important output lines.
 
 ## References
 

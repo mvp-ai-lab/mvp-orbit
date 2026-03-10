@@ -16,164 +16,133 @@ orbit init hub
 orbit hub serve
 ```
 
+`orbit init hub` prints:
+
+- the Hub URL
+- the API token
+- `ORBIT_NODE_SHARED_CONFIG`
+
 ### Agent machine
 
 ```bash
-orbit init agent --agent-id agent-a
+orbit init node --agent-id agent-a
 orbit agent run
 ```
 
-## Runtime object flow
+Or bootstrap from the Hub-generated shared string:
 
-### 1) Upload package
+```bash
+orbit init node --agent-id agent-a --shared-config "$ORBIT_NODE_SHARED_CONFIG"
+orbit agent run
+```
+
+## Package flow
+
+### Upload package
 
 ```bash
 orbit package upload --source-dir /path/to/project
 ```
 
-Output:
+Example response:
 
 ```json
 {
   "package_id": "sha256-...",
-  "file_count": 42
+  "size": 12345,
+  "created_at": "2026-03-10T00:00:00+00:00"
 }
 ```
 
-### 2) Upload command
+## Command flow
 
-Example command file:
-
-```json
-{
-  "argv": ["python3", "train.py", "--epochs", "1"],
-  "env_patch": {},
-  "timeout_sec": 3600,
-  "working_dir": "."
-}
-```
-
-Upload:
+### Execute against a package
 
 ```bash
-orbit command upload --file command.json
-```
-
-Output:
-
-```json
-{
-  "command_id": "sha256-..."
-}
-```
-
-### 3) Upload task
-
-```bash
-orbit task upload \
-  --package-id <PACKAGE_ID> \
-  --command-id <COMMAND_ID> \
-  --created-by "$USER"
-```
-
-Output:
-
-```json
-{
-  "task_id": "sha256-...",
-  "package_id": "sha256-...",
-  "command_id": "sha256-..."
-}
-```
-
-### 4) Submit run
-
-```bash
-orbit run submit \
+orbit command exec \
   --agent-id agent-a \
-  --task-id <TASK_ID>
+  --package-id <PACKAGE_ID> \
+  python3 train.py --epochs 1
 ```
 
-Output:
+### Execute in the Agent base workspace
+
+```bash
+orbit command exec \
+  --agent-id agent-a \
+  bash -lc 'pwd && ls'
+```
+
+### Execute without waiting
+
+```bash
+orbit command exec \
+  --agent-id agent-a \
+  --package-id <PACKAGE_ID> \
+  --detach \
+  python3 train.py
+```
+
+Example detached response:
 
 ```json
 {
-  "run_id": "run-...",
+  "command_id": "cmd-...",
   "agent_id": "agent-a",
-  "task_id": "sha256-...",
-  "run_ticket": "...",
-  "expires_at": "..."
+  "status": "queued",
+  "package_id": "sha256-..."
 }
 ```
 
-## Run inspection
-
-### Status
+### Inspect a command
 
 ```bash
-orbit run status --run-id <RUN_ID>
-```
-
-### Logs
-
-```bash
-orbit run logs --run-id <RUN_ID>
-
-orbit run logs --run-id <RUN_ID> --follow
+orbit command status --command-id <COMMAND_ID>
+orbit command output --command-id <COMMAND_ID>
+orbit command output --command-id <COMMAND_ID> --follow
+orbit command cancel --command-id <COMMAND_ID>
 ```
 
 Notes:
 
-- Prefer `--follow` when monitoring an active run.
-- Use the non-follow form when you want a point-in-time snapshot or to re-fetch the collected logs after completion.
-- `--follow` prints incremental stdout/stderr as chunks arrive.
-- The Agent uploads a chunk every 10 seconds by default, or earlier when buffered output exceeds 16 KiB.
+- `command exec` waits and streams output unless `--detach` is used.
+- `command output --follow` is the right choice when reattaching to a detached command.
+- `command output` returns stdout, stderr, offsets, and the current terminal or non-terminal status.
+- Use `command cancel` to stop a queued or running command.
 
-### Result
+## Shell flow
 
-```bash
-orbit run result --run-id <RUN_ID>
-```
+### Start a shell
 
-### Cancel
+Base workspace:
 
 ```bash
-orbit run cancel --run-id <RUN_ID>
+orbit shell start --agent-id agent-a
 ```
 
-### Clean relay content
+Package workspace:
 
 ```bash
-orbit relay clean --yes
+orbit shell start --agent-id agent-a --package-id <PACKAGE_ID>
 ```
 
-Notes:
+### Reattach or close
 
-- This is destructive.
-- It deletes the managed releases under the configured `release_prefix-*` namespace in the relay repository.
-
-Result shape:
-
-```json
-{
-  "run_id": "run-...",
-  "result": {
-    "status": "succeeded",
-    "exit_code": 0,
-    "started_at": "...",
-    "finished_at": "..."
-  }
-}
+```bash
+orbit shell attach --session-id <SESSION_ID>
+orbit shell close --session-id <SESSION_ID>
 ```
 
-## Suggested AI loop
+While attached locally:
 
-1. modify files
-2. upload package
-3. write `command.json`
-4. upload command
-5. upload task
-6. submit run
-7. follow logs while the run is active
-8. fetch final status/result or cancel the run
-9. decide next code change
+- `/detach` keeps the remote shell alive and disconnects the local terminal
+- `/close` closes the remote shell
+
+## Removed legacy flow
+
+The following old steps are no longer part of the product:
+
+- upload command JSON
+- create a task object
+- submit a run and poll by `run_id`
+- use any external storage service
