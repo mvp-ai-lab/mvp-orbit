@@ -56,7 +56,7 @@ def create_app(
         ticket_manager = RunTicketManager(_required_env("ORBIT_TICKET_SECRET"))
     require_auth = _auth_dependency(api_token)
 
-    app = FastAPI(title="mvp-orbit-hub", version="0.2.0")
+    app = FastAPI(title="mvp-orbit-hub", version="0.3.0")
 
     @app.get("/health")
     def health() -> dict[str, str]:
@@ -167,7 +167,7 @@ try:
     app = create_app()
 except RuntimeError:
     # Import-time fallback for environments that only need create_app() or main().
-    app = FastAPI(title="mvp-orbit-hub", version="0.2.0")
+    app = FastAPI(title="mvp-orbit-hub", version="0.3.0")
 
 
 def main() -> None:
