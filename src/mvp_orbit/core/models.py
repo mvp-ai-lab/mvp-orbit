@@ -1,186 +1,203 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from enum import Enum
-from typing import Any
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from mvp_orbit.core.canonical import object_id_for_json
+
+class CommandStatus(str, Enum):
+    QUEUED = "queued"
+    RUNNING = "running"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+    CANCELED = "canceled"
 
 
-class ObjectNamespace(str, Enum):
-    PACKAGE = "package"
-    COMMAND = "command"
-    TASK = "task"
-    LOG = "log"
-    RESULT = "result"
-    ARTIFACT = "artifact"
+class ShellSessionStatus(str, Enum):
+    QUEUED = "queued"
+    RUNNING = "running"
+    CLOSED = "closed"
+    FAILED = "failed"
 
 
-class CommandObject(BaseModel):
+class PackageRecord(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    package_id: str = Field(min_length=8)
+    size: int = Field(ge=0)
+    created_at: datetime
+
+
+class CommandCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    agent_id: str = Field(min_length=1)
+    package_id: str | None = None
     argv: list[str] = Field(min_length=1)
     env_patch: dict[str, str] = Field(default_factory=dict)
     timeout_sec: int = Field(default=3600, ge=1, le=86400)
     working_dir: str = "."
 
 
-class TaskObject(BaseModel):
+class CommandRecord(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    task_version: int = 1
-    package_id: str = Field(min_length=8)
-    command_id: str = Field(min_length=8)
-    constraints: dict[str, Any] = Field(default_factory=dict)
-    created_by: str | None = None
+    command_id: str
+    agent_id: str
+    package_id: str | None = None
+    argv: list[str]
+    env_patch: dict[str, str] = Field(default_factory=dict)
+    timeout_sec: int
+    working_dir: str
+    status: CommandStatus
     created_at: datetime
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+    heartbeat_at: datetime | None = None
+    cancel_requested_at: datetime | None = None
+    exit_code: int | None = None
+    failure_code: str | None = None
+    stdout_path: str | None = None
+    stderr_path: str | None = None
 
 
-class SignedTaskObject(BaseModel):
+class CommandLease(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    task_id: str
-    task: TaskObject
-    task_signature: str
-    signer: str | None = None
+    command_id: str
+    agent_id: str
+    package_id: str | None = None
+    argv: list[str]
+    env_patch: dict[str, str] = Field(default_factory=dict)
+    timeout_sec: int
+    working_dir: str
 
-    def computed_task_id(self) -> str:
-        return object_id_for_json(self.task.model_dump(mode="json", exclude_none=True))
 
-
-class LogObject(BaseModel):
+class CommandCompletionRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    run_id: str
-    seq: int = Field(ge=1)
-    stream: str = Field(pattern="^(stdout|stderr)$")
-    data: str
-    captured_at: datetime
-
-
-class ResultObject(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    status: str
+    status: CommandStatus
     exit_code: int
-    started_at: datetime
-    finished_at: datetime
-
-
-class RunStatus(str, Enum):
-    QUEUED = "queued"
-    LEASED = "leased"
-    RUNNING = "running"
-    CANCELED = "canceled"
-    SUCCEEDED = "succeeded"
-    FAILED = "failed"
-    REJECTED = "rejected"
-
-
-class RunCreateRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    agent_id: str = Field(min_length=1)
-    task_id: str = Field(min_length=8)
-
-
-class RunCreateResponse(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    run_id: str
-    agent_id: str
-    task_id: str
-    run_ticket: str
-    expires_at: datetime
-
-
-class RunLease(BaseModel):
-    model_config = ConfigDict(extra="ignore")
-
-    run_id: str
-    agent_id: str
-    task_id: str
-    run_ticket: str
-    expires_at: datetime
-
-
-class TicketPayload(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    run_id: str
-    agent_id: str
-    task_id: str
-    nonce: str
-    issued_at: datetime
-    expires_at: datetime
-
-
-class RunHeartbeatRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    phase: str = Field(default="running", pattern="^(preparing|running)$")
-
-
-class RunHeartbeatResponse(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    status: str = "accepted"
-    cancel_requested: bool = False
-
-
-class RunCompletionRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    status: RunStatus
-    log_ids: list[str] = Field(default_factory=list)
-    result_id: str | None = None
-    artifact_ids: list[str] = Field(default_factory=list)
     failure_code: str | None = None
 
     @field_validator("status")
     @classmethod
-    def validate_final_status(cls, value: RunStatus) -> RunStatus:
-        if value not in {RunStatus.SUCCEEDED, RunStatus.FAILED, RunStatus.REJECTED, RunStatus.CANCELED}:
-            raise ValueError("completion status must be a final state")
+    def validate_final_status(cls, value: CommandStatus) -> CommandStatus:
+        if value not in {CommandStatus.SUCCEEDED, CommandStatus.FAILED, CommandStatus.CANCELED}:
+            raise ValueError("completion status must be final")
         return value
 
 
-class RunLogAppendRequest(BaseModel):
+class CommandOutputAppendRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    log_ids: list[str] = Field(default_factory=list)
+    stream: str = Field(pattern="^(stdout|stderr)$")
+    data: str
 
 
-class RunRecord(BaseModel):
+class CommandOutputChunk(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    run_id: str
-    agent_id: str
-    task_id: str
-    run_ticket: str
-    expires_at: datetime
-    status: RunStatus
-    created_at: datetime
-    leased_at: datetime | None = None
-    heartbeat_at: datetime | None = None
-    cancel_requested_at: datetime | None = None
-    completed_at: datetime | None = None
-    log_ids: list[str] = Field(default_factory=list)
-    result_id: str | None = None
-    artifact_ids: list[str] = Field(default_factory=list)
+    command_id: str
+    status: CommandStatus
+    stdout: str = ""
+    stderr: str = ""
+    stdout_offset: int = 0
+    stderr_offset: int = 0
+    exit_code: int | None = None
     failure_code: str | None = None
+
+
+class ShellSessionCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    agent_id: str = Field(min_length=1)
+    package_id: str | None = None
+
+
+class ShellSessionRecord(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    session_id: str
+    agent_id: str
+    package_id: str | None = None
+    cwd_root: str
+    status: ShellSessionStatus
+    created_at: datetime
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+    heartbeat_at: datetime | None = None
+    close_requested_at: datetime | None = None
+    exit_code: int | None = None
+    failure_code: str | None = None
+
+
+class ShellSessionLease(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    session_id: str
+    agent_id: str
+    package_id: str | None = None
+    cwd_root: str
+
+
+class ShellInputRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    data: str = Field(min_length=1)
+
+
+class ShellEvent(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    seq: int = Field(ge=1)
+    stream: str = Field(pattern="^(stdout|stderr|system)$")
+    data: str
+    created_at: datetime
+
+
+class ShellEventAppendRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    stream: str = Field(pattern="^(stdout|stderr|system)$")
+    data: str
+
+
+class ShellEventsResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    session_id: str
+    status: ShellSessionStatus
+    events: list[ShellEvent] = Field(default_factory=list)
+    next_seq: int = 1
+    exit_code: int | None = None
+    failure_code: str | None = None
+
+
+class ShellCompletionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    status: ShellSessionStatus
+    exit_code: int
+    failure_code: str | None = None
+
+    @field_validator("status")
+    @classmethod
+    def validate_final_status(cls, value: ShellSessionStatus) -> ShellSessionStatus:
+        if value not in {ShellSessionStatus.CLOSED, ShellSessionStatus.FAILED}:
+            raise ValueError("completion status must be final")
+        return value
 
 
 def utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def default_run_id() -> str:
-    return f"run-{uuid4().hex}"
+def default_command_id() -> str:
+    return f"cmd-{uuid4().hex}"
 
 
-def default_ticket_expiry(seconds: int = 120) -> datetime:
-    return utc_now() + timedelta(seconds=seconds)
+def default_shell_session_id() -> str:
+    return f"shell-{uuid4().hex}"

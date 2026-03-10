@@ -1,103 +1,37 @@
 from __future__ import annotations
 
 import io
+import os
 import shutil
 import subprocess
 import tarfile
 import threading
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
-from mvp_orbit.core.canonical import require_matching_json_object_id, require_matching_object_id
-from mvp_orbit.core.models import LogObject, ResultObject, RunLease, RunStatus
-from mvp_orbit.core.signing import SignatureError, verify_payload_signature
-from mvp_orbit.core.tickets import ReplayGuard, RunTicketManager, TicketError
-from mvp_orbit.integrations.object_store import ObjectStore
+from mvp_orbit.core.canonical import require_matching_object_id
+from mvp_orbit.core.models import (
+    CommandLease,
+    CommandStatus,
+    ShellSessionLease,
+    ShellSessionStatus,
+)
 
 
 @dataclass
-class ExecutionOutcome:
-    status: RunStatus
-    log_ids: list[str]
-    result_id: str
-    artifact_ids: list[str]
+class CommandExecutionOutcome:
+    status: CommandStatus
+    exit_code: int
     failure_code: str | None = None
 
 
-class CanceledRunError(Exception):
-    pass
-
-
-class LiveLogStreamer:
-    def __init__(
-        self,
-        *,
-        run_id: str,
-        object_store: ObjectStore,
-        publish_logs: Callable[[list[str]], None] | None,
-        flush_interval_sec: float = 10.0,
-        flush_bytes: int = 16 * 1024,
-    ) -> None:
-        self.run_id = run_id
-        self.object_store = object_store
-        self.publish_logs = publish_logs
-        self.flush_interval_sec = flush_interval_sec
-        self.flush_bytes = flush_bytes
-        self._lock = threading.Lock()
-        self._buffers = {"stdout": [], "stderr": []}
-        self._sizes = {"stdout": 0, "stderr": 0}
-        self._last_flush = time.monotonic()
-        self._next_seq = 1
-        self.log_ids: list[str] = []
-
-    def append(self, stream: str, data: str) -> None:
-        if not data:
-            return
-        with self._lock:
-            self._buffers[stream].append(data)
-            self._sizes[stream] += len(data.encode("utf-8"))
-
-    def flush_ready(self, *, force: bool = False) -> None:
-        now = time.monotonic()
-        ready: list[tuple[int, LogObject]] = []
-        with self._lock:
-            for stream in ("stdout", "stderr"):
-                has_data = bool(self._buffers[stream])
-                due_by_size = self._sizes[stream] >= self.flush_bytes
-                due_by_time = has_data and (now - self._last_flush >= self.flush_interval_sec)
-                if not has_data or not (force or due_by_size or due_by_time):
-                    continue
-                payload = "".join(self._buffers[stream])
-                self._buffers[stream].clear()
-                self._sizes[stream] = 0
-                seq = self._next_seq
-                self._next_seq += 1
-                ready.append(
-                    (
-                        seq,
-                        LogObject(
-                            run_id=self.run_id,
-                            seq=seq,
-                            stream=stream,
-                            data=payload,
-                            captured_at=datetime.now(timezone.utc),
-                        ),
-                    )
-                )
-            if ready:
-                self._last_flush = now
-        if not ready:
-            return
-        ready.sort(key=lambda item: item[0])
-        new_log_ids: list[str] = []
-        for _, log in ready:
-            new_log_ids.append(self.object_store.put_log(log))
-        self.log_ids.extend(new_log_ids)
-        if self.publish_logs is not None:
-            self.publish_logs(new_log_ids)
+@dataclass
+class ShellExecutionOutcome:
+    status: ShellSessionStatus
+    exit_code: int
+    failure_code: str | None = None
 
 
 class AgentRuntime:
@@ -105,147 +39,30 @@ class AgentRuntime:
         self,
         *,
         agent_id: str,
-        ticket_manager: RunTicketManager,
-        replay_guard: ReplayGuard,
-        object_store: ObjectStore,
-        verify_public_key_b64: str,
-        workspace_root: str | Path,
+        base_workspace: str | Path,
         heartbeat_interval_sec: float = 5.0,
     ) -> None:
         self.agent_id = agent_id
-        self.ticket_manager = ticket_manager
-        self.replay_guard = replay_guard
-        self.object_store = object_store
-        self.verify_public_key_b64 = verify_public_key_b64
-        self.workspace_root = Path(workspace_root)
-        self.workspace_root.mkdir(parents=True, exist_ok=True)
+        self.base_workspace = Path(base_workspace).resolve()
+        self.base_workspace.mkdir(parents=True, exist_ok=True)
+        self.packages_root = self.base_workspace / ".orbit" / "packages"
+        self.packages_root.mkdir(parents=True, exist_ok=True)
         self.heartbeat_interval_sec = heartbeat_interval_sec
 
-    def handle_run(
+    def handle_command(
         self,
-        lease: RunLease,
+        lease: CommandLease,
         *,
-        heartbeat: Callable[[str], bool] | None = None,
-        publish_logs: Callable[[list[str]], None] | None = None,
-    ) -> ExecutionOutcome:
-        try:
-            package_id, command = self._validate_and_load_objects(lease)
-            if heartbeat is not None:
-                if heartbeat("preparing"):
-                    raise CanceledRunError("run canceled before execution")
-            workspace = self._prepare_workspace(lease.run_id, package_id)
-            return self._execute_command(lease, command, workspace, heartbeat, publish_logs)
-        except CanceledRunError as exc:
-            now = datetime.now(timezone.utc)
-            stderr_log_id = self.object_store.put_log(
-                LogObject(run_id=lease.run_id, seq=1, stream="stderr", data=str(exc), captured_at=now)
-            )
-            result_id = self.object_store.put_result(
-                ResultObject(
-                    status=RunStatus.CANCELED.value,
-                    exit_code=-15,
-                    started_at=now,
-                    finished_at=now,
-                )
-            )
-            if publish_logs is not None:
-                publish_logs([stderr_log_id])
-            return ExecutionOutcome(
-                status=RunStatus.CANCELED,
-                log_ids=[stderr_log_id],
-                result_id=result_id,
-                artifact_ids=[],
-                failure_code="canceled",
-            )
-        except Exception as exc:
-            now = datetime.now(timezone.utc)
-            stderr_log_id = self.object_store.put_log(
-                LogObject(run_id=lease.run_id, seq=1, stream="stderr", data=str(exc), captured_at=now)
-            )
-            result_id = self.object_store.put_result(
-                ResultObject(
-                    status=RunStatus.REJECTED.value,
-                    exit_code=1,
-                    started_at=now,
-                    finished_at=now,
-                )
-            )
-            if publish_logs is not None:
-                publish_logs([stderr_log_id])
-            return ExecutionOutcome(
-                status=RunStatus.REJECTED,
-                log_ids=[stderr_log_id],
-                result_id=result_id,
-                artifact_ids=[],
-                failure_code="rejected",
-            )
+        fetch_package: Callable[[str], bytes],
+        append_output: Callable[[str, str], None],
+        heartbeat: Callable[[], bool],
+    ) -> CommandExecutionOutcome:
+        workspace = self._command_workspace(lease, fetch_package)
+        cwd = self._resolve_working_dir(workspace, lease.working_dir)
+        env = self._merged_env(lease.env_patch)
 
-    def _validate_and_load_objects(self, lease: RunLease):
-        if lease.agent_id != self.agent_id:
-            raise RuntimeError(f"run is assigned to a different agent: {lease.agent_id}")
-
-        try:
-            ticket = self.ticket_manager.verify(lease.run_ticket)
-            self.replay_guard.consume(ticket.nonce)
-        except TicketError as exc:
-            raise RuntimeError(f"ticket rejected: {exc}") from exc
-
-        if (
-            ticket.run_id != lease.run_id
-            or ticket.agent_id != lease.agent_id
-            or ticket.task_id != lease.task_id
-        ):
-            raise RuntimeError("ticket claims do not match run lease")
-
-        signed_task = self.object_store.get_signed_task(lease.task_id)
-        task_payload = signed_task.task.model_dump(mode="json", exclude_none=True)
-        require_matching_json_object_id(lease.task_id, task_payload)
-        try:
-            verify_payload_signature(task_payload, signed_task.task_signature, self.verify_public_key_b64)
-        except SignatureError as exc:
-            raise RuntimeError(f"task signature verification failed: {exc}") from exc
-
-        package_id = signed_task.task.package_id
-        command_id = signed_task.task.command_id
-
-        command = self.object_store.get_command(command_id)
-        require_matching_json_object_id(
-            command_id,
-            command.model_dump(mode="json", exclude_none=True),
-        )
-
-        package_bytes = self.object_store.get_package(package_id)
-        require_matching_object_id(package_id, package_bytes)
-        return package_id, command
-
-    def _prepare_workspace(self, run_id: str, package_id: str) -> Path:
-        workspace = self.workspace_root / run_id
-        if workspace.exists():
-            shutil.rmtree(workspace)
-        workspace.mkdir(parents=True, exist_ok=True)
-
-        package_bytes = self.object_store.get_package(package_id)
-        with tarfile.open(fileobj=io.BytesIO(package_bytes), mode="r:gz") as tar:
-            self._extract_safely(tar, workspace)
-        return workspace
-
-    def _execute_command(
-        self,
-        lease: RunLease,
-        command,
-        workspace: Path,
-        heartbeat: Callable[[str], bool] | None,
-        publish_logs: Callable[[list[str]], None] | None,
-    ) -> ExecutionOutcome:
-        started_at = datetime.now(timezone.utc)
-        cwd = (workspace / command.working_dir).resolve()
-        workspace_root = workspace.resolve()
-        if cwd != workspace_root and workspace_root not in cwd.parents:
-            raise RuntimeError("command working_dir escapes workspace")
-
-        env = self._merged_env(command.env_patch)
         proc = subprocess.Popen(
-            command.argv,
+            lease.argv,
             cwd=str(cwd),
             env=env,
             stdout=subprocess.PIPE,
@@ -258,32 +75,35 @@ class AgentRuntime:
         assert proc.stdout is not None
         assert proc.stderr is not None
 
-        streamer = LiveLogStreamer(
-            run_id=lease.run_id,
-            object_store=self.object_store,
-            publish_logs=publish_logs,
+        stdout_thread = threading.Thread(
+            target=self._stream_reader,
+            args=(proc.stdout, "stdout", append_output),
+            daemon=True,
         )
-        stdout_thread = threading.Thread(target=self._read_stream, args=(proc.stdout, "stdout", streamer), daemon=True)
-        stderr_thread = threading.Thread(target=self._read_stream, args=(proc.stderr, "stderr", streamer), daemon=True)
+        stderr_thread = threading.Thread(
+            target=self._stream_reader,
+            args=(proc.stderr, "stderr", append_output),
+            daemon=True,
+        )
         stdout_thread.start()
         stderr_thread.start()
 
+        deadline = time.monotonic() + lease.timeout_sec
         next_heartbeat = time.monotonic()
-        deadline = time.monotonic() + command.timeout_sec
-        timed_out = False
         canceled = False
+        timed_out = False
+        return_code = 0
         while True:
-            streamer.flush_ready()
-            if heartbeat is not None and time.monotonic() >= next_heartbeat:
-                if heartbeat("running"):
-                    return_code = self._terminate_process(proc)
-                    timed_out = False
-                    canceled = True
-                    break
+            if time.monotonic() >= next_heartbeat:
+                canceled = heartbeat()
                 next_heartbeat = time.monotonic() + self.heartbeat_interval_sec
+                if canceled:
+                    return_code = self._terminate_process(proc)
+                    break
 
-            return_code = proc.poll()
-            if return_code is not None:
+            polled = proc.poll()
+            if polled is not None:
+                return_code = polled
                 break
             if time.monotonic() >= deadline:
                 timed_out = True
@@ -295,70 +115,157 @@ class AgentRuntime:
 
         stdout_thread.join(timeout=2)
         stderr_thread.join(timeout=2)
-        streamer.flush_ready(force=True)
 
-        finished_at = datetime.now(timezone.utc)
-        status = RunStatus.SUCCEEDED if return_code == 0 and not timed_out and not canceled else RunStatus.FAILED
-        failure_code = "timeout" if timed_out else None
         if canceled:
-            status = RunStatus.CANCELED
-            failure_code = "canceled"
-        result_id = self.object_store.put_result(
-            ResultObject(
-                status=status.value,
-                exit_code=return_code,
-                started_at=started_at,
-                finished_at=finished_at,
-            )
-        )
-        return ExecutionOutcome(
-            status=status,
-            log_ids=streamer.log_ids,
-            result_id=result_id,
-            artifact_ids=[],
-            failure_code=failure_code,
-        )
+            return CommandExecutionOutcome(status=CommandStatus.CANCELED, exit_code=return_code, failure_code="canceled")
+        if timed_out:
+            return CommandExecutionOutcome(status=CommandStatus.FAILED, exit_code=return_code, failure_code="timeout")
+        status = CommandStatus.SUCCEEDED if return_code == 0 else CommandStatus.FAILED
+        return CommandExecutionOutcome(status=status, exit_code=return_code)
 
-    @staticmethod
-    def _terminate_process(proc: subprocess.Popen[str], grace_sec: float = 10.0) -> int:
-        proc.terminate()
-        deadline = time.monotonic() + grace_sec
-        while time.monotonic() < deadline:
-            return_code = proc.poll()
-            if return_code is not None:
-                return return_code
+    def handle_shell_session(
+        self,
+        lease: ShellSessionLease,
+        *,
+        fetch_package: Callable[[str], bytes],
+        get_inputs: Callable[[int], list[tuple[int, str]]],
+        append_event: Callable[[str, str], None],
+        heartbeat: Callable[[], bool],
+        should_close: Callable[[], bool],
+    ) -> ShellExecutionOutcome:
+        workspace = self._shell_workspace(lease, fetch_package)
+        proc = subprocess.Popen(
+            self._shell_argv(),
+            cwd=str(workspace),
+            env=self._merged_env({}),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+        )
+        assert proc.stdin is not None
+        assert proc.stdout is not None
+        assert proc.stderr is not None
+
+        stdout_thread = threading.Thread(
+            target=self._stream_reader,
+            args=(proc.stdout, "stdout", append_event),
+            daemon=True,
+        )
+        stderr_thread = threading.Thread(
+            target=self._stream_reader,
+            args=(proc.stderr, "stderr", append_event),
+            daemon=True,
+        )
+        stdout_thread.start()
+        stderr_thread.start()
+
+        next_input_seq = 0
+        next_heartbeat = time.monotonic()
+        while True:
+            if time.monotonic() >= next_heartbeat:
+                heartbeat()
+                next_heartbeat = time.monotonic() + self.heartbeat_interval_sec
+
+            for seq, data in get_inputs(next_input_seq):
+                proc.stdin.write(data)
+                proc.stdin.flush()
+                next_input_seq = seq
+
+            polled = proc.poll()
+            if polled is not None:
+                stdout_thread.join(timeout=2)
+                stderr_thread.join(timeout=2)
+                status = ShellSessionStatus.CLOSED if polled == 0 else ShellSessionStatus.FAILED
+                return ShellExecutionOutcome(status=status, exit_code=polled)
+
+            if should_close():
+                proc.stdin.write("exit\n")
+                proc.stdin.flush()
+                try:
+                    return_code = proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    return_code = self._terminate_process(proc)
+                stdout_thread.join(timeout=2)
+                stderr_thread.join(timeout=2)
+                status = ShellSessionStatus.CLOSED if return_code == 0 else ShellSessionStatus.FAILED
+                failure = None if return_code == 0 else "closed"
+                return ShellExecutionOutcome(status=status, exit_code=return_code, failure_code=failure)
             time.sleep(0.2)
-        proc.kill()
-        proc.wait()
-        return proc.returncode if proc.returncode is not None else -9
 
-    @staticmethod
-    def _extract_safely(tar: tarfile.TarFile, destination: Path) -> None:
-        destination_root = destination.resolve()
-        for member in tar.getmembers():
-            member_path = (destination / member.name).resolve()
-            if destination_root != member_path and destination_root not in member_path.parents:
-                raise RuntimeError(f"illegal package path: {member.name}")
-        try:
-            tar.extractall(destination, filter="data")
-        except TypeError:
-            tar.extractall(destination)
+    def _command_workspace(self, lease: CommandLease, fetch_package: Callable[[str], bytes]) -> Path:
+        if lease.package_id is None:
+            return self.base_workspace
+        return self._ensure_package_workspace(lease.package_id, fetch_package)
 
-    @staticmethod
-    def _merged_env(extra_env: dict[str, str]) -> dict[str, str]:
-        import os
+    def _shell_workspace(self, lease: ShellSessionLease, fetch_package: Callable[[str], bytes]) -> Path:
+        if lease.package_id is None:
+            return self.base_workspace
+        return self._ensure_package_workspace(lease.package_id, fetch_package)
 
+    def _ensure_package_workspace(self, package_id: str, fetch_package: Callable[[str], bytes]) -> Path:
+        workspace = self.packages_root / package_id
+        marker = workspace / ".orbit-ready"
+        if marker.exists():
+            return workspace
+
+        package_bytes = fetch_package(package_id)
+        require_matching_object_id(package_id, package_bytes)
+        if workspace.exists():
+            shutil.rmtree(workspace)
+        workspace.mkdir(parents=True, exist_ok=True)
+        with tarfile.open(fileobj=io.BytesIO(package_bytes), mode="r:gz") as tar:
+            self._extract_safely(tar, workspace)
+        marker.write_text("ready\n", encoding="utf-8")
+        return workspace
+
+    def _resolve_working_dir(self, workspace: Path, working_dir: str) -> Path:
+        cwd = (workspace / working_dir).resolve()
+        workspace_root = workspace.resolve()
+        if cwd != workspace_root and workspace_root not in cwd.parents:
+            raise RuntimeError("command working_dir escapes workspace")
+        cwd.mkdir(parents=True, exist_ok=True)
+        return cwd
+
+    def _merged_env(self, patch: dict[str, str]) -> dict[str, str]:
         env = os.environ.copy()
-        env.update(extra_env)
+        env.update(patch)
         return env
 
     @staticmethod
-    def _read_stream(pipe, stream: str, streamer: LiveLogStreamer) -> None:
+    def _stream_reader(handle, stream: str, callback: Callable[[str, str], None]) -> None:
         try:
             while True:
-                chunk = pipe.read(4096)
-                if not chunk:
+                chunk = handle.readline()
+                if chunk == "":
                     break
-                streamer.append(stream, chunk)
+                callback(stream, chunk)
         finally:
-            pipe.close()
+            handle.close()
+
+    @staticmethod
+    def _terminate_process(proc: subprocess.Popen) -> int:
+        proc.terminate()
+        try:
+            return proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            return proc.wait()
+
+    @staticmethod
+    def _shell_argv() -> list[str]:
+        if Path("/bin/bash").exists():
+            return ["/bin/bash", "-i"]
+        return ["/bin/sh", "-i"]
+
+    @staticmethod
+    def _extract_safely(tar: tarfile.TarFile, destination: Path) -> None:
+        root = destination.resolve()
+        for member in tar.getmembers():
+            target = (destination / member.name).resolve()
+            if target != root and root not in target.parents:
+                raise RuntimeError(f"package member escapes workspace: {member.name}")
+        tar.extractall(destination)

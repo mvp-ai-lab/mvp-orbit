@@ -4,23 +4,26 @@ import os
 import secrets
 
 import uvicorn
-from fastapi import Depends, FastAPI, Header, HTTPException, Response, status
+from fastapi import Body, Depends, FastAPI, Header, HTTPException, Query, Response, status
 
+from mvp_orbit.core.canonical import object_id_for_bytes
 from mvp_orbit.core.models import (
-    RunCompletionRequest,
-    RunCreateRequest,
-    RunCreateResponse,
-    RunHeartbeatRequest,
-    RunHeartbeatResponse,
-    RunLogAppendRequest,
-    RunRecord,
-    RunStatus,
-    default_run_id,
-    default_ticket_expiry,
-    utc_now,
+    CommandCompletionRequest,
+    CommandCreateRequest,
+    CommandOutputAppendRequest,
+    CommandOutputChunk,
+    CommandRecord,
+    PackageRecord,
+    ShellCompletionRequest,
+    ShellEventAppendRequest,
+    ShellEventsResponse,
+    ShellInputRequest,
+    ShellSessionCreateRequest,
+    ShellSessionRecord,
+    default_command_id,
+    default_shell_session_id,
 )
-from mvp_orbit.core.tickets import RunTicketManager
-from mvp_orbit.hub.store import RunStore
+from mvp_orbit.hub.store import HubStore
 
 
 def _required_env(name: str, default: str | None = None) -> str:
@@ -43,17 +46,12 @@ def _auth_dependency(expected_token: str | None):
     return _check_auth
 
 
-def create_app(
-    *,
-    run_store: RunStore | None = None,
-    ticket_manager: RunTicketManager | None = None,
-    api_token: str | None = None,
-) -> FastAPI:
+def create_app(*, store: HubStore | None = None, api_token: str | None = None) -> FastAPI:
     api_token = api_token if api_token is not None else os.getenv("ORBIT_API_TOKEN")
-    ticket_ttl = int(os.getenv("ORBIT_TICKET_TTL_SEC", "120"))
-    run_store = run_store or RunStore(os.getenv("ORBIT_HUB_DB", "./.orbit-hub/runs.sqlite3"))
-    if ticket_manager is None:
-        ticket_manager = RunTicketManager(_required_env("ORBIT_TICKET_SECRET"))
+    store = store or HubStore(
+        os.getenv("ORBIT_HUB_DB", "./.orbit-hub/hub.sqlite3"),
+        os.getenv("ORBIT_OBJECT_ROOT", "./.orbit-hub/objects"),
+    )
     require_auth = _auth_dependency(api_token)
 
     app = FastAPI(title="mvp-orbit-hub", version="0.3.0")
@@ -62,116 +60,178 @@ def create_app(
     def health() -> dict[str, str]:
         return {"status": "ok"}
 
-    @app.post("/api/runs", response_model=RunCreateResponse, dependencies=[Depends(require_auth)])
-    def create_run(request: RunCreateRequest) -> RunCreateResponse:
-        run_id = default_run_id()
-        expires_at = default_ticket_expiry(ticket_ttl)
-        run_ticket, _ = ticket_manager.issue(
-            run_id=run_id,
-            agent_id=request.agent_id,
-            task_id=request.task_id,
-            expires_at=expires_at,
-        )
-        record = RunRecord(
-            run_id=run_id,
-            agent_id=request.agent_id,
-            task_id=request.task_id,
-            run_ticket=run_ticket,
-            expires_at=expires_at,
-            status=RunStatus.QUEUED,
-            created_at=utc_now(),
-        )
-        run_store.create_run(record)
-        return RunCreateResponse(
-            run_id=run_id,
-            agent_id=request.agent_id,
-            task_id=request.task_id,
-            run_ticket=run_ticket,
-            expires_at=expires_at,
-        )
+    @app.post("/api/packages", response_model=PackageRecord, dependencies=[Depends(require_auth)])
+    def upload_package(payload: bytes = Body(..., media_type="application/gzip")) -> PackageRecord:
+        package_id = object_id_for_bytes(payload)
+        return store.put_package(package_id, payload)
 
-    @app.get("/api/agents/{agent_id}/next", dependencies=[Depends(require_auth)], response_model=None)
-    def poll_next(agent_id: str) -> Response | dict:
-        record = run_store.lease_next(agent_id)
+    @app.get("/api/packages/{package_id}", dependencies=[Depends(require_auth)], response_model=None)
+    def download_package(package_id: str) -> Response:
+        try:
+            payload = store.get_package(package_id)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="package not found") from exc
+        return Response(content=payload, media_type="application/gzip")
+
+    @app.post("/api/commands", response_model=CommandRecord, dependencies=[Depends(require_auth)])
+    def create_command(request: CommandCreateRequest) -> CommandRecord:
+        return store.create_command(default_command_id(), request)
+
+    @app.get("/api/commands/{command_id}", response_model=CommandRecord, dependencies=[Depends(require_auth)])
+    def get_command(command_id: str) -> CommandRecord:
+        record = store.get_command(command_id)
         if record is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="command not found")
+        return record
+
+    @app.get("/api/commands/{command_id}/output", response_model=CommandOutputChunk, dependencies=[Depends(require_auth)])
+    def get_command_output(
+        command_id: str,
+        stdout_offset: int = Query(default=0, ge=0),
+        stderr_offset: int = Query(default=0, ge=0),
+    ) -> CommandOutputChunk:
+        try:
+            return store.read_command_output(
+                command_id,
+                stdout_offset=stdout_offset,
+                stderr_offset=stderr_offset,
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="command not found") from exc
+
+    @app.post("/api/commands/{command_id}/output", dependencies=[Depends(require_auth)])
+    def append_command_output(command_id: str, request: CommandOutputAppendRequest) -> dict[str, str]:
+        try:
+            store.append_command_output(command_id, request.stream, request.data)
+        except KeyError as exc:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="command not found") from exc
+        return {"status": "accepted"}
+
+    @app.post("/api/commands/{command_id}/cancel", response_model=CommandRecord, dependencies=[Depends(require_auth)])
+    def cancel_command(command_id: str) -> CommandRecord:
+        try:
+            return store.cancel_command(command_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="command not found") from exc
+
+    @app.get("/api/agents/{agent_id}/commands/next", dependencies=[Depends(require_auth)], response_model=None)
+    def poll_next_command(agent_id: str) -> Response | dict:
+        lease = store.lease_next_command(agent_id)
+        if lease is None:
             return Response(status_code=status.HTTP_204_NO_CONTENT)
-        return record.model_dump(mode="json", include={"run_id", "agent_id", "task_id", "run_ticket", "expires_at"})
+        return lease.model_dump(mode="json")
 
-    @app.post("/api/runs/{run_id}/heartbeat", dependencies=[Depends(require_auth)], response_model=RunHeartbeatResponse)
-    def heartbeat(run_id: str, heartbeat_request: RunHeartbeatRequest) -> RunHeartbeatResponse:
+    @app.post("/api/commands/{command_id}/heartbeat", response_model=CommandRecord, dependencies=[Depends(require_auth)])
+    def heartbeat_command(command_id: str) -> CommandRecord:
         try:
-            record = run_store.heartbeat(run_id, phase=heartbeat_request.phase)
+            return store.heartbeat_command(command_id)
         except KeyError as exc:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="run not found") from exc
-        return RunHeartbeatResponse(cancel_requested=record.cancel_requested_at is not None)
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="command not found") from exc
 
-    @app.post("/api/runs/{run_id}/cancel", dependencies=[Depends(require_auth)])
-    def cancel(run_id: str) -> dict[str, str]:
+    @app.post("/api/commands/{command_id}/complete", response_model=CommandRecord, dependencies=[Depends(require_auth)])
+    def complete_command(command_id: str, request: CommandCompletionRequest) -> CommandRecord:
         try:
-            record = run_store.cancel(run_id)
+            return store.complete_command(command_id, request)
         except KeyError as exc:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="run not found") from exc
-        return {"status": record.status.value}
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="command not found") from exc
 
-    @app.post("/api/runs/{run_id}/complete", dependencies=[Depends(require_auth)])
-    def complete(run_id: str, completion: RunCompletionRequest) -> dict[str, str]:
-        try:
-            run_store.complete(run_id, completion)
-        except KeyError as exc:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="run not found") from exc
-        return {"status": "accepted"}
+    @app.post("/api/shells", response_model=ShellSessionRecord, dependencies=[Depends(require_auth)])
+    def create_shell_session(request: ShellSessionCreateRequest) -> ShellSessionRecord:
+        cwd_root = "." if request.package_id is None else f".orbit/packages/{request.package_id}"
+        return store.create_shell_session(default_shell_session_id(), request, cwd_root=cwd_root)
 
-    @app.post("/api/runs/{run_id}/logs", dependencies=[Depends(require_auth)])
-    def append_logs(run_id: str, request: RunLogAppendRequest) -> dict[str, str]:
-        try:
-            run_store.append_log_ids(run_id, request.log_ids)
-        except KeyError as exc:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="run not found") from exc
-        return {"status": "accepted"}
-
-    @app.get("/api/runs/{run_id}", dependencies=[Depends(require_auth)])
-    def get_run(run_id: str) -> dict:
-        record = run_store.get_run(run_id)
+    @app.get("/api/shells/{session_id}", response_model=ShellSessionRecord, dependencies=[Depends(require_auth)])
+    def get_shell_session(session_id: str) -> ShellSessionRecord:
+        record = store.get_shell_session(session_id)
         if record is None:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="run not found")
-        return record.model_dump(mode="json")
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="shell session not found")
+        return record
+
+    @app.post("/api/shells/{session_id}/input", dependencies=[Depends(require_auth)])
+    def append_shell_input(session_id: str, request: ShellInputRequest) -> dict[str, int]:
+        if store.get_shell_session(session_id) is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="shell session not found")
+        return {"seq": store.append_shell_input(session_id, request.data)}
+
+    @app.get("/api/shells/{session_id}/events", response_model=ShellEventsResponse, dependencies=[Depends(require_auth)])
+    def get_shell_events(session_id: str, after_seq: int = Query(default=0, ge=0)) -> ShellEventsResponse:
+        record = store.get_shell_session(session_id)
+        if record is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="shell session not found")
+        events = store.get_shell_events(session_id, after_seq)
+        next_seq = after_seq + 1 if not events else events[-1].seq + 1
+        return ShellEventsResponse(
+            session_id=session_id,
+            status=record.status,
+            events=events,
+            next_seq=next_seq,
+            exit_code=record.exit_code,
+            failure_code=record.failure_code,
+        )
+
+    @app.post("/api/shells/{session_id}/close", response_model=ShellSessionRecord, dependencies=[Depends(require_auth)])
+    def close_shell_session(session_id: str) -> ShellSessionRecord:
+        try:
+            return store.close_shell_session(session_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="shell session not found") from exc
+
+    @app.get("/api/agents/{agent_id}/shells/next", dependencies=[Depends(require_auth)], response_model=None)
+    def poll_next_shell(agent_id: str) -> Response | dict:
+        lease = store.lease_next_shell_session(agent_id)
+        if lease is None:
+            return Response(status_code=status.HTTP_204_NO_CONTENT)
+        return lease.model_dump(mode="json")
+
+    @app.get("/api/shells/{session_id}/inputs", dependencies=[Depends(require_auth)])
+    def consume_shell_inputs(session_id: str, after_seq: int = Query(default=0, ge=0)) -> dict:
+        if store.get_shell_session(session_id) is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="shell session not found")
+        items = store.consume_shell_inputs(session_id, after_seq)
+        return {"inputs": [{"seq": seq, "data": data} for seq, data in items]}
+
+    @app.post("/api/shells/{session_id}/events", dependencies=[Depends(require_auth)])
+    def append_shell_event(session_id: str, request: ShellEventAppendRequest) -> dict:
+        if store.get_shell_session(session_id) is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="shell session not found")
+        event = store.append_shell_event(session_id, request.stream, request.data)
+        return event.model_dump(mode="json")
+
+    @app.post("/api/shells/{session_id}/heartbeat", response_model=ShellSessionRecord, dependencies=[Depends(require_auth)])
+    def heartbeat_shell_session(session_id: str) -> ShellSessionRecord:
+        try:
+            return store.heartbeat_shell_session(session_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="shell session not found") from exc
+
+    @app.post("/api/shells/{session_id}/complete", response_model=ShellSessionRecord, dependencies=[Depends(require_auth)])
+    def complete_shell_session(session_id: str, request: ShellCompletionRequest) -> ShellSessionRecord:
+        try:
+            return store.complete_shell_session(session_id, request)
+        except KeyError as exc:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="shell session not found") from exc
 
     return app
 
 
-def _ensure_runtime_secret(name: str, *, generator) -> str:
-    current = os.getenv(name)
+def _ensure_runtime_token() -> str:
+    current = os.getenv("ORBIT_API_TOKEN")
     if current:
         return current
-    value = generator()
-    os.environ[name] = value
-    print(f"{name}={value}")
+    value = secrets.token_urlsafe(32)
+    os.environ["ORBIT_API_TOKEN"] = value
+    print(f"ORBIT_API_TOKEN={value}")
     return value
-
-
-def _bootstrap_runtime_settings() -> None:
-    generated: list[str] = []
-
-    if not os.getenv("ORBIT_TICKET_SECRET"):
-        _ensure_runtime_secret("ORBIT_TICKET_SECRET", generator=lambda: secrets.token_urlsafe(48))
-        generated.append("ORBIT_TICKET_SECRET")
-    if not os.getenv("ORBIT_API_TOKEN"):
-        _ensure_runtime_secret("ORBIT_API_TOKEN", generator=lambda: secrets.token_urlsafe(32))
-        generated.append("ORBIT_API_TOKEN")
-
-    if generated:
-        print("Generated missing Hub secrets for this process. Export the values above if other processes must reuse them.")
 
 
 try:
     app = create_app()
 except RuntimeError:
-    # Import-time fallback for environments that only need create_app() or main().
     app = FastAPI(title="mvp-orbit-hub", version="0.3.0")
 
 
 def main() -> None:
-    _bootstrap_runtime_settings()
+    _ensure_runtime_token()
     host = os.getenv("ORBIT_HUB_HOST", "127.0.0.1")
     port = int(os.getenv("ORBIT_HUB_PORT", "8080"))
     uvicorn.run(create_app(), host=host, port=port, reload=False)
