@@ -5,6 +5,9 @@ __pycache__/
 
 build/
 dist/
+.release-build/
+dist-clean/
+.pip-cache/
 *.egg-info/
 
 .orbit-hub/

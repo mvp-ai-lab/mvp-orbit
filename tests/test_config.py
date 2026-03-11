@@ -1,15 +1,23 @@
 from __future__ import annotations
 
 from argparse import Namespace
+from datetime import datetime, timedelta, timezone
+
+from fastapi.testclient import TestClient
 
 from mvp_orbit.cli.main import _command_create_request, build_parser, main, prepare_args
-from mvp_orbit.config import OrbitConfig, apply_node_shared_config, encode_node_shared_config, ensure_hub_token, load_config
+from mvp_orbit.config import OrbitConfig, ensure_bootstrap_token, load_config
+from mvp_orbit.hub.app import create_app
+from mvp_orbit.hub.store import HubStore
+
+
+BOOTSTRAP_TOKEN = "bootstrap-token"
 
 
 def test_init_hub_writes_default_config(monkeypatch, tmp_path, capsys):
     config_path = tmp_path / "config.toml"
     monkeypatch.setenv("ORBIT_CONFIG", str(config_path))
-    answers = iter(["0.0.0.0", "10551", "", "", "http://127.0.0.1:10551"])
+    answers = iter(["0.0.0.0", "10551", "", "", "http://127.0.0.1:10551", ""])
     monkeypatch.setattr("builtins.input", lambda _: next(answers))
 
     assert main(["init", "hub"]) == 0
@@ -18,55 +26,68 @@ def test_init_hub_writes_default_config(monkeypatch, tmp_path, capsys):
     assert config.hub.host == "0.0.0.0"
     assert config.hub.port == 10551
     assert config.hub.url == "http://127.0.0.1:10551"
-    assert config.auth.api_token
+    assert config.auth.bootstrap_token
 
     output = capsys.readouterr().out
     assert "ORBIT HUB SETUP" in output
-    assert "ORBIT_NODE_SHARED_CONFIG=" in output
-    assert "ORBIT_API_TOKEN=" in output
+    assert "ORBIT_BOOTSTRAP_TOKEN=" in output
 
 
-def test_node_shared_config_round_trip():
-    config = OrbitConfig()
-    config.hub.url = "http://127.0.0.1:10551"
-    ensure_hub_token(config)
-
-    shared = encode_node_shared_config(config)
-    restored = apply_node_shared_config(OrbitConfig(), shared)
-
-    assert restored.hub.url == "http://127.0.0.1:10551"
-    assert restored.auth.api_token == config.auth.api_token
-
-
-def test_init_node_accepts_shared_config(monkeypatch, tmp_path):
+def test_init_node_writes_user_token_and_expiry(monkeypatch, tmp_path):
     config_path = tmp_path / "config.toml"
     monkeypatch.setenv("ORBIT_CONFIG", str(config_path))
-
-    base = OrbitConfig()
-    base.hub.url = "http://127.0.0.1:10551"
-    ensure_hub_token(base)
-    shared = encode_node_shared_config(base)
-
-    answers = iter(["agent-a", "", "", ""])
+    expires_at = "2026-03-18T12:00:00+00:00"
+    answers = iter(["agent-a", "http://127.0.0.1:10551", "user-token", expires_at, "", "", ""])
     monkeypatch.setattr("builtins.input", lambda _: next(answers))
 
-    assert main(["init", "node", "--shared-config", shared]) == 0
+    assert main(["init", "node"]) == 0
 
     _, config = load_config(config_path)
     assert config.agent.id == "agent-a"
     assert config.hub.url == "http://127.0.0.1:10551"
-    assert config.auth.api_token == base.auth.api_token
+    assert config.auth.user_token == "user-token"
+    assert config.auth.expires_at == datetime.fromisoformat(expires_at)
+
+
+def test_connect_writes_user_token_and_expiry(monkeypatch, tmp_path):
+    config_path = tmp_path / "config.toml"
+    monkeypatch.setenv("ORBIT_CONFIG", str(config_path))
+    store = HubStore(tmp_path / "hub.sqlite3", tmp_path / "objects")
+    client = TestClient(create_app(store=store, bootstrap_token=BOOTSTRAP_TOKEN))
+
+    class _ClientWrapper:
+        def __init__(self, inner):
+            self.inner = inner
+
+        def __enter__(self):
+            return self.inner
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    monkeypatch.setattr("mvp_orbit.cli.main.httpx.Client", lambda timeout=20: _ClientWrapper(client))
+    answers = iter(["http://127.0.0.1:10551", "alice", BOOTSTRAP_TOKEN])
+    monkeypatch.setattr("builtins.input", lambda _: next(answers))
+
+    assert main(["connect", "--hub-url", "http://127.0.0.1:10551"]) == 0
+
+    _, config = load_config(config_path)
+    assert config.hub.url == "http://127.0.0.1:10551"
+    assert config.auth.user_token
+    assert config.auth.expires_at is not None
 
 
 def test_prepare_args_uses_config_defaults(monkeypatch, tmp_path):
     config_path = tmp_path / "config.toml"
+    expires_at = "2026-03-18T12:00:00+00:00"
     config_path.write_text(
-        """
+        f"""
 [hub]
 url = "http://127.0.0.1:10551"
 
 [auth]
-api_token = "api-token"
+user_token = "user-token"
+expires_at = "{expires_at}"
 
 [agent]
 id = "agent-a"
@@ -90,7 +111,8 @@ id = "agent-a"
         ),
     )
     assert exec_args.hub_url == "http://127.0.0.1:10551"
-    assert exec_args.api_token == "api-token"
+    assert exec_args.user_token == "user-token"
+    assert exec_args.token_expires_at == expires_at
     assert exec_args.agent_id == "agent-a"
 
     package_args = prepare_args(
@@ -105,19 +127,14 @@ id = "agent-a"
         ),
     )
     assert package_args.hub_url == "http://127.0.0.1:10551"
-    assert package_args.api_token == "api-token"
+    assert package_args.user_token == "user-token"
+    assert package_args.token_expires_at == expires_at
 
-    shell_list_args = prepare_args(
-        parser,
-        parser.parse_args(
-            [
-                "shell",
-                "list",
-            ]
-        ),
-    )
-    assert shell_list_args.hub_url == "http://127.0.0.1:10551"
-    assert shell_list_args.api_token == "api-token"
+
+def test_ensure_bootstrap_token_populates_config():
+    config = OrbitConfig()
+    ensure_bootstrap_token(config)
+    assert config.auth.bootstrap_token
 
 
 def test_command_create_request_auto_wraps_single_shell_string():
@@ -152,3 +169,21 @@ def test_command_create_request_supports_explicit_shell_mode():
         )
     )
     assert request.argv == ["/bin/sh", "-lc", "cd /cache/models/ && echo ok"]
+
+
+def test_connect_token_expires_in_roughly_seven_days(tmp_path):
+    store = HubStore(tmp_path / "hub.sqlite3", tmp_path / "objects")
+    client = TestClient(create_app(store=store, bootstrap_token=BOOTSTRAP_TOKEN))
+
+    before = datetime.now(timezone.utc)
+    response = client.post(
+        "/api/connect",
+        json={"user_id": "alice"},
+        headers={"Authorization": f"Bearer {BOOTSTRAP_TOKEN}"},
+    )
+    after = datetime.now(timezone.utc)
+
+    assert response.status_code == 200
+    expires_at = datetime.fromisoformat(response.json()["expires_at"])
+    assert before + timedelta(days=7) <= expires_at + timedelta(seconds=1)
+    assert expires_at <= after + timedelta(days=7, seconds=1)

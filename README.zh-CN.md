@@ -42,6 +42,8 @@ Orbit 围绕三个面向用户的动作构建：
 - 带 `package_id` 的命令会在基础工作区下对应的 package 子目录执行。
 - shell 默认在基础工作区启动；如果提供了 `package_id`，则在对应 package 工作区启动。
 - Hub、CLI 和 Agent 之间只通过 HTTP + Bearer token 通信。
+- `orbit connect` 用 Hub 的 bootstrap token 换取一个 7 天有效的 user token。
+- user token 只能操作该用户名下的 Agent 和资源。
 
 ## 快速开始
 
@@ -55,19 +57,20 @@ orbit hub serve
 `orbit init hub` 会输出：
 
 - Hub URL
-- API token
-- `ORBIT_NODE_SHARED_CONFIG`
+- 给 `orbit connect` 使用的 bootstrap token
 
-### 2. 初始化节点 / Agent
+### 2. 以用户身份 connect
+
+```bash
+orbit connect --hub-url http://127.0.0.1:8080
+```
+
+`orbit connect` 会把 7 天有效的 `user_token` 和 `expires_at` 写入本地配置。
+
+### 3. 初始化节点 / Agent
 
 ```bash
 orbit init node --agent-id agent-a
-```
-
-或者直接使用 Hub 生成的共享串完成初始化：
-
-```bash
-orbit init node --agent-id agent-a --shared-config "$ORBIT_NODE_SHARED_CONFIG"
 ```
 
 然后启动 Agent：
@@ -192,7 +195,9 @@ object_root = "./.orbit-hub/objects"
 url = "http://127.0.0.1:8080"
 
 [auth]
-api_token = "..."
+bootstrap_token = "..."  # 仅 Hub 使用
+user_token = "..."       # 仅用户 / Agent 使用
+expires_at = "2026-03-18T12:34:56+00:00"
 
 [agent]
 id = "agent-a"

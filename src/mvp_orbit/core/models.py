@@ -30,6 +30,36 @@ class PackageRecord(BaseModel):
     created_at: datetime
 
 
+class UserRecord(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    user_id: str = Field(min_length=1)
+    created_at: datetime
+
+
+class AgentRecord(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    agent_id: str = Field(min_length=1)
+    owner_user_id: str = Field(min_length=1)
+    created_at: datetime
+    last_seen_at: datetime | None = None
+
+
+class ConnectRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    user_id: str = Field(min_length=1)
+
+
+class ConnectResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    user_id: str = Field(min_length=1)
+    user_token: str = Field(min_length=1)
+    expires_at: datetime
+
+
 class CommandCreateRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -46,6 +76,7 @@ class CommandRecord(BaseModel):
 
     command_id: str
     agent_id: str
+    owner_user_id: str
     package_id: str | None = None
     argv: list[str]
     env_patch: dict[str, str] = Field(default_factory=dict)
@@ -122,6 +153,7 @@ class ShellSessionRecord(BaseModel):
 
     session_id: str
     agent_id: str
+    owner_user_id: str
     package_id: str | None = None
     cwd_root: str
     status: ShellSessionStatus

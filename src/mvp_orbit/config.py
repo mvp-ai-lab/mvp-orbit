@@ -1,17 +1,15 @@
 from __future__ import annotations
 
-import base64
 import json
 import os
 import secrets
 import tomllib
+from datetime import datetime
 from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, Field
 
 DEFAULT_CONFIG_PATH = Path("~/.config/mvp-orbit/config.toml").expanduser()
-NODE_SHARED_CONFIG_PREFIX = "orbit-node:"
-NODE_SHARED_CONFIG_VERSION = 1
 
 
 class HubConfig(BaseModel):
@@ -30,7 +28,9 @@ class HubConfig(BaseModel):
 class AuthConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    api_token: str | None = None
+    bootstrap_token: str | None = None
+    user_token: str | None = None
+    expires_at: datetime | None = None
 
 
 class AgentConfig(BaseModel):
@@ -77,42 +77,9 @@ def save_config(config: OrbitConfig, path: str | Path | None = None) -> Path:
     return resolved
 
 
-def ensure_hub_token(config: OrbitConfig) -> OrbitConfig:
-    if not config.auth.api_token:
-        config.auth.api_token = secrets.token_urlsafe(32)
-    return config
-
-
-def encode_node_shared_config(config: OrbitConfig) -> str:
-    payload = {
-        "version": NODE_SHARED_CONFIG_VERSION,
-        "hub": {"url": config.hub.resolved_url()},
-        "auth": {"api_token": config.auth.api_token},
-    }
-    if not payload["hub"]["url"] or not payload["auth"]["api_token"]:
-        raise ValueError("cannot encode node shared config without hub.url and auth.api_token")
-    encoded = base64.urlsafe_b64encode(
-        json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
-    ).decode("ascii")
-    return f"{NODE_SHARED_CONFIG_PREFIX}{encoded.rstrip('=')}"
-
-
-def apply_node_shared_config(config: OrbitConfig, shared_config: str) -> OrbitConfig:
-    if not shared_config.startswith(NODE_SHARED_CONFIG_PREFIX):
-        raise ValueError(f"node shared config must start with {NODE_SHARED_CONFIG_PREFIX}")
-    token = shared_config[len(NODE_SHARED_CONFIG_PREFIX) :]
-    padding = "=" * (-len(token) % 4)
-    try:
-        payload = json.loads(base64.urlsafe_b64decode((token + padding).encode("ascii")).decode("utf-8"))
-    except Exception as exc:  # pragma: no cover - defensive parsing
-        raise ValueError("invalid node shared config encoding") from exc
-    if payload.get("version") != NODE_SHARED_CONFIG_VERSION:
-        raise ValueError(f"unsupported node shared config version: {payload.get('version')!r}")
-
-    config.hub.url = HubConfig.model_validate(payload.get("hub") or {}).resolved_url()
-    config.auth = AuthConfig.model_validate(payload.get("auth") or {})
-    if not config.hub.url or not config.auth.api_token:
-        raise ValueError("node shared config is missing required values")
+def ensure_bootstrap_token(config: OrbitConfig) -> OrbitConfig:
+    if not config.auth.bootstrap_token:
+        config.auth.bootstrap_token = secrets.token_urlsafe(32)
     return config
 
 

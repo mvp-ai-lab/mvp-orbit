@@ -3,9 +3,11 @@ from __future__ import annotations
 import logging
 import os
 from pathlib import Path
+from datetime import datetime
 
 from mvp_orbit.agent.runtime import AgentRuntime
 from mvp_orbit.agent.service import AgentService
+from mvp_orbit.core.models import utc_now
 
 
 def _required(name: str, default: str | None = None) -> str:
@@ -18,6 +20,10 @@ def _required(name: str, default: str | None = None) -> str:
 def main() -> None:
     agent_id = _required("ORBIT_AGENT_ID")
     hub_url = _required("ORBIT_HUB_URL")
+    user_token = _required("ORBIT_USER_TOKEN")
+    expires_at = datetime.fromisoformat(_required("ORBIT_TOKEN_EXPIRES_AT"))
+    if expires_at <= utc_now():
+        raise RuntimeError("user token expired; run `orbit connect` again")
     logging.basicConfig(
         level=getattr(logging, os.getenv("ORBIT_LOG_LEVEL", "INFO").upper(), logging.INFO),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
@@ -42,7 +48,7 @@ def main() -> None:
         agent_id=agent_id,
         hub_url=hub_url,
         runtime=runtime,
-        api_token=os.getenv("ORBIT_API_TOKEN"),
+        user_token=user_token,
         poll_interval_sec=float(os.getenv("ORBIT_AGENT_POLL_SEC", "5")),
     )
     service.run_forever()

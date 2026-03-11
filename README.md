@@ -42,6 +42,8 @@ Key runtime semantics:
 - Commands with `package_id` run in a package-specific subdirectory under the base workspace.
 - Shell sessions start in the base workspace by default, or in the package workspace when `package_id` is provided.
 - Hub, CLI, and Agent communicate using HTTP + Bearer token only.
+- `orbit connect` exchanges a Hub bootstrap token for a 7-day user token.
+- A user token can control only that user's Agents and resources.
 
 ## Quick Start
 
@@ -55,19 +57,30 @@ orbit hub serve
 `orbit init hub` prints:
 
 - the Hub URL
-- the API token
-- `ORBIT_NODE_SHARED_CONFIG`
+- the bootstrap token used by `orbit connect`
 
-### 2. Initialize a node / Agent
+Build and run the Hub with Docker:
+
+```bash
+docker build -t mvp-orbit-hub .
+docker run --rm -p 8080:8080 \
+  -e ORBIT_BOOTSTRAP_TOKEN=your-bootstrap-token \
+  -v "$PWD/orbit-data:/var/lib/orbit" \
+  mvp-orbit-hub
+```
+
+### 2. Connect as a user
+
+```bash
+orbit connect --hub-url http://127.0.0.1:8080
+```
+
+`orbit connect` writes a 7-day `user_token` and `expires_at` into your local config.
+
+### 3. Initialize a node / Agent
 
 ```bash
 orbit init node --agent-id agent-a
-```
-
-Or bootstrap from the Hub-generated shared string:
-
-```bash
-orbit init node --agent-id agent-a --shared-config "$ORBIT_NODE_SHARED_CONFIG"
 ```
 
 Then start the Agent:
@@ -192,7 +205,9 @@ object_root = "./.orbit-hub/objects"
 url = "http://127.0.0.1:8080"
 
 [auth]
-api_token = "..."
+bootstrap_token = "..."  # hub only
+user_token = "..."       # user/agent only
+expires_at = "2026-03-18T12:34:56+00:00"
 
 [agent]
 id = "agent-a"

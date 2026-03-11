@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import getpass
 import json
 import os
 import re
@@ -9,21 +10,22 @@ import sys
 import textwrap
 import threading
 import time
+from datetime import datetime
 from pathlib import Path
 
 import httpx
 import questionary
 
 from mvp_orbit.cli.package import build_file_package
-from mvp_orbit.config import (
-    OrbitConfig,
-    apply_node_shared_config,
-    encode_node_shared_config,
-    ensure_hub_token,
-    load_config,
-    save_config,
+from mvp_orbit.config import OrbitConfig, ensure_bootstrap_token, load_config, save_config
+from mvp_orbit.core.models import (
+    CommandCreateRequest,
+    CommandStatus,
+    ConnectRequest,
+    ShellSessionCreateRequest,
+    ShellSessionStatus,
+    utc_now,
 )
-from mvp_orbit.core.models import CommandCreateRequest, CommandStatus, ShellSessionCreateRequest, ShellSessionStatus
 
 _SHELL_META_PATTERN = re.compile(r"(?:&&|\|\||[|;<>()$`\n])")
 
@@ -162,10 +164,10 @@ class SetupWizard:
         print()
 
 
-def _headers(api_token: str | None) -> dict[str, str]:
+def _headers(user_token: str | None) -> dict[str, str]:
     headers = {"Accept": "application/json"}
-    if api_token:
-        headers["Authorization"] = f"Bearer {api_token}"
+    if user_token:
+        headers["Authorization"] = f"Bearer {user_token}"
     return headers
 
 
@@ -176,7 +178,8 @@ def _set_if_missing(args: argparse.Namespace, name: str, value) -> None:
 
 def _apply_config_defaults(args: argparse.Namespace, config: OrbitConfig) -> None:
     _set_if_missing(args, "hub_url", config.hub.resolved_url())
-    _set_if_missing(args, "api_token", config.auth.api_token)
+    _set_if_missing(args, "user_token", config.auth.user_token)
+    _set_if_missing(args, "token_expires_at", config.auth.expires_at.isoformat() if config.auth.expires_at else None)
     _set_if_missing(args, "agent_id", config.agent.id)
 
 
@@ -192,7 +195,9 @@ def _apply_runtime_env(config: OrbitConfig) -> None:
     _set_env_if_missing("ORBIT_HUB_DB", config.hub.db)
     _set_env_if_missing("ORBIT_OBJECT_ROOT", config.hub.object_root)
     _set_env_if_missing("ORBIT_HUB_URL", config.hub.resolved_url())
-    _set_env_if_missing("ORBIT_API_TOKEN", config.auth.api_token)
+    _set_env_if_missing("ORBIT_BOOTSTRAP_TOKEN", config.auth.bootstrap_token)
+    _set_env_if_missing("ORBIT_USER_TOKEN", config.auth.user_token)
+    _set_env_if_missing("ORBIT_TOKEN_EXPIRES_AT", config.auth.expires_at.isoformat() if config.auth.expires_at else None)
     _set_env_if_missing("ORBIT_AGENT_ID", config.agent.id)
     _set_env_if_missing("ORBIT_WORKSPACE_ROOT", config.agent.workspace_root)
     _set_env_if_missing("ORBIT_AGENT_POLL_SEC", str(config.agent.poll_interval_sec))
@@ -227,11 +232,28 @@ def _prompt_float(wizard: SetupWizard, label: str, default: float, *, hint: str 
             print(wizard._warning("enter a number"))
 
 
+def _parse_datetime(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    return datetime.fromisoformat(value)
+
+
+def _require_live_user_token(user_token: str | None, expires_at: str | datetime | None) -> str:
+    if not user_token:
+        raise RuntimeError("missing user token; run `orbit connect` first")
+    expiry = _parse_datetime(expires_at) if isinstance(expires_at, str) else expires_at
+    if expiry is None:
+        raise RuntimeError("missing token expiry; run `orbit connect` first")
+    if expiry <= utc_now():
+        raise RuntimeError("user token expired; run `orbit connect` again")
+    return user_token
+
+
 def cmd_init_hub(args: argparse.Namespace) -> int:
     config_path, config = load_config(args.config)
     wizard = SetupWizard(
         "ORBIT HUB SETUP",
-        "Configure the Hub API, local object storage, and the shared API token for all nodes.",
+        "Configure the Hub API, local object storage, and the bootstrap token used by `orbit connect`.",
     )
     wizard.section("Hub Service", "These values define where the Hub listens and where it stores packages and command output.")
     config.hub.host = wizard.prompt("Hub bind host", config.hub.host)
@@ -240,20 +262,25 @@ def cmd_init_hub(args: argparse.Namespace) -> int:
     config.hub.object_root = wizard.prompt("Hub object root", config.hub.object_root)
     config.hub.url = wizard.prompt("Hub public URL", config.hub.resolved_url())
 
-    ensure_hub_token(config)
-    saved_path = save_config(config, config_path)
-    shared_config = encode_node_shared_config(config)
+    ensure_bootstrap_token(config)
+    wizard.section("Bootstrap Token", "This token is only used by `orbit connect` to mint 7-day user tokens.")
+    config.auth.bootstrap_token = wizard.prompt(
+        "Bootstrap token",
+        config.auth.bootstrap_token,
+        required=True,
+        secret=True,
+    )
 
+    saved_path = save_config(config, config_path)
     wizard.summary(
         "Hub Ready",
         [
             f"Config saved: {saved_path}",
             f"Hub URL: {config.hub.resolved_url()}",
-            "Distribute ORBIT_NODE_SHARED_CONFIG to every node.",
+            "Users now authenticate through `orbit connect`.",
         ],
     )
-    print(f"ORBIT_API_TOKEN={config.auth.api_token}")
-    print(f"ORBIT_NODE_SHARED_CONFIG={shared_config}")
+    print(f"ORBIT_BOOTSTRAP_TOKEN={config.auth.bootstrap_token}")
     return 0
 
 
@@ -261,28 +288,22 @@ def cmd_init_node(args: argparse.Namespace) -> int:
     config_path, config = load_config(args.config)
     wizard = SetupWizard(
         "ORBIT NODE SETUP",
-        "Configure a node that can upload packages, submit commands, and run the agent loop.",
+        "Configure a node that runs an agent with a 7-day user token from `orbit connect`.",
     )
-    shared_config = args.shared_config
-    if wizard.interactive and not shared_config:
-        wizard.section(
-            "Shared Bootstrap",
-            "If you already have the ORBIT_NODE_SHARED_CONFIG string from `orbit init hub`, you can import shared values in one step.",
-        )
-        if wizard.boolean("Do you have an ORBIT_NODE_SHARED_CONFIG string?", False):
-            shared_config = wizard.prompt("ORBIT_NODE_SHARED_CONFIG", required=True)
-    if shared_config:
-        config = apply_node_shared_config(config, shared_config)
 
     wizard.section("Identity", "This node ID is how the Hub targets command execution.")
     config.agent.id = wizard.prompt("Agent ID", args.agent_id or config.agent.id, required=True)
 
-    if not shared_config:
-        wizard.section("Hub Access", "These values let the node talk to the Hub over HTTP.")
-        config.hub.url = wizard.prompt("Hub URL", config.hub.resolved_url(), required=True)
-        config.auth.api_token = wizard.prompt("Hub API token", config.auth.api_token, required=True, secret=True)
-    else:
-        wizard.section("Shared Config", "Imported Hub URL and API token from the shared bootstrap string.")
+    wizard.section("Hub Access", "These values let the node talk to the Hub over HTTP using a user token.")
+    config.hub.url = wizard.prompt("Hub URL", config.hub.resolved_url(), required=True)
+    config.auth.user_token = wizard.prompt("User token", config.auth.user_token, required=True, secret=True)
+    config.auth.expires_at = _parse_datetime(
+        wizard.prompt(
+            "Token expires at (ISO8601)",
+            config.auth.expires_at.isoformat() if config.auth.expires_at else None,
+            required=True,
+        )
+    )
 
     wizard.section(
         "Runtime",
@@ -299,6 +320,7 @@ def cmd_init_node(args: argparse.Namespace) -> int:
             f"Config saved: {saved_path}",
             f"Agent ID: {config.agent.id}",
             f"Hub URL: {config.hub.resolved_url()}",
+            f"Token expires at: {config.auth.expires_at.isoformat() if config.auth.expires_at else '-'}",
         ],
     )
     return 0
@@ -308,13 +330,53 @@ def cmd_init_agent(args: argparse.Namespace) -> int:
     return cmd_init_node(args)
 
 
+def cmd_connect(args: argparse.Namespace) -> int:
+    config_path, config = load_config(args.config)
+    hub_url = args.hub_url or config.hub.resolved_url()
+    user_id = args.user_id or getpass.getuser()
+    wizard = SetupWizard(
+        "ORBIT CONNECT",
+        "Exchange the Hub bootstrap token for a 7-day user token.",
+    )
+    wizard.section("Hub", "Connect writes the returned user token into your local Orbit config.")
+    hub_url = wizard.prompt("Hub URL", hub_url, required=True)
+    user_id = wizard.prompt("User ID", user_id, required=True)
+    bootstrap_token = wizard.prompt("Bootstrap token", required=True, secret=True)
+
+    request = ConnectRequest(user_id=user_id)
+    with httpx.Client(timeout=20) as client:
+        response = client.post(
+            f"{hub_url}/api/connect",
+            headers={**_headers(None), "Authorization": f"Bearer {bootstrap_token}"},
+            json=request.model_dump(mode="json"),
+        )
+        response.raise_for_status()
+        payload = response.json()
+
+    config.hub.url = hub_url
+    config.auth.user_token = payload["user_token"]
+    config.auth.expires_at = _parse_datetime(payload["expires_at"])
+    saved_path = save_config(config, config_path)
+
+    wizard.summary(
+        "Connected",
+        [
+            f"Config saved: {saved_path}",
+            f"User ID: {payload['user_id']}",
+            f"Token expires at: {payload['expires_at']}",
+        ],
+    )
+    return 0
+
+
 def cmd_package_upload(args: argparse.Namespace) -> int:
+    user_token = _require_live_user_token(args.user_token, args.token_expires_at)
     build = build_file_package(args.source_dir, tmp_dir=args.tmp_dir)
     try:
         with httpx.Client(timeout=60) as client:
             response = client.post(
                 f"{args.hub_url}/api/packages",
-                headers={**_headers(args.api_token), "Content-Type": "application/gzip"},
+                headers={**_headers(user_token), "Content-Type": "application/gzip"},
                 content=build.archive_path.read_bytes(),
             )
             response.raise_for_status()
@@ -351,11 +413,12 @@ def _shell_wrapped_argv(command: str) -> list[str]:
 
 
 def cmd_command_exec(args: argparse.Namespace) -> int:
+    user_token = _require_live_user_token(args.user_token, args.token_expires_at)
     request = _command_create_request(args)
     with httpx.Client(timeout=60) as client:
         response = client.post(
             f"{args.hub_url}/api/commands",
-            headers=_headers(args.api_token),
+            headers=_headers(user_token),
             json=request.model_dump(mode="json"),
         )
         response.raise_for_status()
@@ -364,26 +427,28 @@ def cmd_command_exec(args: argparse.Namespace) -> int:
         if args.detach:
             print(json.dumps(payload, ensure_ascii=False, indent=2))
             return 0
-    _follow_command_output(args.hub_url, args.api_token, command_id, poll_interval_sec=args.poll_interval_sec)
+    _follow_command_output(args.hub_url, user_token, command_id, poll_interval_sec=args.poll_interval_sec)
     return 0
 
 
 def cmd_command_status(args: argparse.Namespace) -> int:
+    user_token = _require_live_user_token(args.user_token, args.token_expires_at)
     with httpx.Client(timeout=20) as client:
-        response = client.get(f"{args.hub_url}/api/commands/{args.command_id}", headers=_headers(args.api_token))
+        response = client.get(f"{args.hub_url}/api/commands/{args.command_id}", headers=_headers(user_token))
         response.raise_for_status()
         print(json.dumps(response.json(), ensure_ascii=False, indent=2))
     return 0
 
 
 def cmd_command_output(args: argparse.Namespace) -> int:
+    user_token = _require_live_user_token(args.user_token, args.token_expires_at)
     if args.follow:
-        _follow_command_output(args.hub_url, args.api_token, args.command_id, poll_interval_sec=args.poll_interval_sec)
+        _follow_command_output(args.hub_url, user_token, args.command_id, poll_interval_sec=args.poll_interval_sec)
         return 0
     with httpx.Client(timeout=20) as client:
         response = client.get(
             f"{args.hub_url}/api/commands/{args.command_id}/output",
-            headers=_headers(args.api_token),
+            headers=_headers(user_token),
         )
         response.raise_for_status()
         print(json.dumps(response.json(), ensure_ascii=False, indent=2))
@@ -391,21 +456,22 @@ def cmd_command_output(args: argparse.Namespace) -> int:
 
 
 def cmd_command_cancel(args: argparse.Namespace) -> int:
+    user_token = _require_live_user_token(args.user_token, args.token_expires_at)
     with httpx.Client(timeout=20) as client:
-        response = client.post(f"{args.hub_url}/api/commands/{args.command_id}/cancel", headers=_headers(args.api_token))
+        response = client.post(f"{args.hub_url}/api/commands/{args.command_id}/cancel", headers=_headers(user_token))
         response.raise_for_status()
         print(json.dumps(response.json(), ensure_ascii=False, indent=2))
     return 0
 
 
-def _follow_command_output(hub_url: str, api_token: str | None, command_id: str, *, poll_interval_sec: float) -> None:
+def _follow_command_output(hub_url: str, user_token: str, command_id: str, *, poll_interval_sec: float) -> None:
     stdout_offset = 0
     stderr_offset = 0
     with httpx.Client(timeout=20) as client:
         while True:
             response = client.get(
                 f"{hub_url}/api/commands/{command_id}/output",
-                headers=_headers(api_token),
+                headers=_headers(user_token),
                 params={"stdout_offset": stdout_offset, "stderr_offset": stderr_offset},
             )
             response.raise_for_status()
@@ -422,11 +488,12 @@ def _follow_command_output(hub_url: str, api_token: str | None, command_id: str,
 
 
 def cmd_shell_start(args: argparse.Namespace) -> int:
+    user_token = _require_live_user_token(args.user_token, args.token_expires_at)
     request = ShellSessionCreateRequest(agent_id=args.agent_id, package_id=args.package_id)
     with httpx.Client(timeout=20) as client:
         response = client.post(
             f"{args.hub_url}/api/shells",
-            headers=_headers(args.api_token),
+            headers=_headers(user_token),
             json=request.model_dump(mode="json"),
         )
         response.raise_for_status()
@@ -435,11 +502,12 @@ def cmd_shell_start(args: argparse.Namespace) -> int:
         print(json.dumps(payload, ensure_ascii=False, indent=2))
         return 0
     print(f"[orbit] shell session {payload['session_id']}", file=sys.stderr, flush=True)
-    _attach_shell(args.hub_url, args.api_token, payload["session_id"], poll_interval_sec=args.poll_interval_sec)
+    _attach_shell(args.hub_url, user_token, payload["session_id"], poll_interval_sec=args.poll_interval_sec)
     return 0
 
 
 def cmd_shell_list(args: argparse.Namespace) -> int:
+    user_token = _require_live_user_token(args.user_token, args.token_expires_at)
     params: dict[str, str] = {}
     if args.agent_id:
         params["agent_id"] = args.agent_id
@@ -448,7 +516,7 @@ def cmd_shell_list(args: argparse.Namespace) -> int:
     with httpx.Client(timeout=20) as client:
         response = client.get(
             f"{args.hub_url}/api/shells",
-            headers=_headers(args.api_token),
+            headers=_headers(user_token),
             params=params or None,
         )
         response.raise_for_status()
@@ -457,19 +525,21 @@ def cmd_shell_list(args: argparse.Namespace) -> int:
 
 
 def cmd_shell_attach(args: argparse.Namespace) -> int:
-    _attach_shell(args.hub_url, args.api_token, args.session_id, poll_interval_sec=args.poll_interval_sec)
+    user_token = _require_live_user_token(args.user_token, args.token_expires_at)
+    _attach_shell(args.hub_url, user_token, args.session_id, poll_interval_sec=args.poll_interval_sec)
     return 0
 
 
 def cmd_shell_close(args: argparse.Namespace) -> int:
+    user_token = _require_live_user_token(args.user_token, args.token_expires_at)
     with httpx.Client(timeout=20) as client:
-        response = client.post(f"{args.hub_url}/api/shells/{args.session_id}/close", headers=_headers(args.api_token))
+        response = client.post(f"{args.hub_url}/api/shells/{args.session_id}/close", headers=_headers(user_token))
         response.raise_for_status()
         print(json.dumps(response.json(), ensure_ascii=False, indent=2))
     return 0
 
 
-def _attach_shell(hub_url: str, api_token: str | None, session_id: str, *, poll_interval_sec: float) -> None:
+def _attach_shell(hub_url: str, user_token: str, session_id: str, *, poll_interval_sec: float) -> None:
     stop = threading.Event()
 
     def poll_events() -> None:
@@ -478,7 +548,7 @@ def _attach_shell(hub_url: str, api_token: str | None, session_id: str, *, poll_
             while not stop.is_set():
                 response = client.get(
                     f"{hub_url}/api/shells/{session_id}/events",
-                    headers=_headers(api_token),
+                    headers=_headers(user_token),
                     params={"after_seq": after_seq},
                 )
                 response.raise_for_status()
@@ -504,12 +574,12 @@ def _attach_shell(hub_url: str, api_token: str | None, session_id: str, *, poll_
                 break
             if line == "/close":
                 with httpx.Client(timeout=20) as client:
-                    client.post(f"{hub_url}/api/shells/{session_id}/close", headers=_headers(api_token))
+                    client.post(f"{hub_url}/api/shells/{session_id}/close", headers=_headers(user_token))
                 break
             with httpx.Client(timeout=20) as client:
                 response = client.post(
                     f"{hub_url}/api/shells/{session_id}/input",
-                    headers=_headers(api_token),
+                    headers=_headers(user_token),
                     json={"data": line + "\n"},
                 )
                 response.raise_for_status()
@@ -521,6 +591,7 @@ def _attach_shell(hub_url: str, api_token: str | None, session_id: str, *, poll_
 
 
 def cmd_agent_run(args: argparse.Namespace) -> int:
+    _require_live_user_token(args._orbit_config.auth.user_token, args._orbit_config.auth.expires_at)
     from mvp_orbit.agent.main import main as agent_main
 
     _apply_runtime_env(args._orbit_config)
@@ -551,12 +622,15 @@ def build_parser() -> argparse.ArgumentParser:
     init_hub.set_defaults(func=cmd_init_hub)
     init_node = init_sub.add_parser("node", help="interactively create/update a node config")
     init_node.add_argument("--agent-id", default=None)
-    init_node.add_argument("--shared-config", default=os.getenv("ORBIT_NODE_SHARED_CONFIG"))
     init_node.set_defaults(func=cmd_init_node)
     init_agent = init_sub.add_parser("agent", help="alias for `orbit init node`")
     init_agent.add_argument("--agent-id", default=None)
-    init_agent.add_argument("--shared-config", default=os.getenv("ORBIT_NODE_SHARED_CONFIG"))
     init_agent.set_defaults(func=cmd_init_agent)
+
+    connect = sub.add_parser("connect", help="exchange a bootstrap token for a 7-day user token")
+    connect.add_argument("--hub-url", default=None)
+    connect.add_argument("--user-id", default=None)
+    connect.set_defaults(func=cmd_connect)
 
     package = sub.add_parser("package", help="package commands")
     package_sub = package.add_subparsers(dest="package_command", required=True)
@@ -564,14 +638,16 @@ def build_parser() -> argparse.ArgumentParser:
     package_upload.add_argument("--source-dir", required=True)
     package_upload.add_argument("--tmp-dir", default=None)
     package_upload.add_argument("--hub-url", default=None)
-    package_upload.add_argument("--api-token", default=os.getenv("ORBIT_API_TOKEN"))
+    package_upload.add_argument("--user-token", default=os.getenv("ORBIT_USER_TOKEN"))
+    package_upload.add_argument("--token-expires-at", default=os.getenv("ORBIT_TOKEN_EXPIRES_AT"))
     package_upload.set_defaults(func=cmd_package_upload)
 
     command = sub.add_parser("command", help="command execution commands")
     command_sub = command.add_subparsers(dest="command_command", required=True)
     command_exec = command_sub.add_parser("exec", help="submit a command for remote execution")
     command_exec.add_argument("--hub-url", default=None)
-    command_exec.add_argument("--api-token", default=os.getenv("ORBIT_API_TOKEN"))
+    command_exec.add_argument("--user-token", default=os.getenv("ORBIT_USER_TOKEN"))
+    command_exec.add_argument("--token-expires-at", default=os.getenv("ORBIT_TOKEN_EXPIRES_AT"))
     command_exec.add_argument("--agent-id", default=None)
     command_exec.add_argument("--package-id", default=None)
     command_exec.add_argument("--working-dir", default=".")
@@ -585,13 +661,15 @@ def build_parser() -> argparse.ArgumentParser:
 
     command_status = command_sub.add_parser("status", help="show command status")
     command_status.add_argument("--hub-url", default=None)
-    command_status.add_argument("--api-token", default=os.getenv("ORBIT_API_TOKEN"))
+    command_status.add_argument("--user-token", default=os.getenv("ORBIT_USER_TOKEN"))
+    command_status.add_argument("--token-expires-at", default=os.getenv("ORBIT_TOKEN_EXPIRES_AT"))
     command_status.add_argument("--command-id", required=True)
     command_status.set_defaults(func=cmd_command_status)
 
     command_output = command_sub.add_parser("output", help="fetch command output")
     command_output.add_argument("--hub-url", default=None)
-    command_output.add_argument("--api-token", default=os.getenv("ORBIT_API_TOKEN"))
+    command_output.add_argument("--user-token", default=os.getenv("ORBIT_USER_TOKEN"))
+    command_output.add_argument("--token-expires-at", default=os.getenv("ORBIT_TOKEN_EXPIRES_AT"))
     command_output.add_argument("--command-id", required=True)
     command_output.add_argument("--follow", action="store_true")
     command_output.add_argument("--poll-interval-sec", type=float, default=0.5)
@@ -599,7 +677,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     command_cancel = command_sub.add_parser("cancel", help="cancel a queued or running command")
     command_cancel.add_argument("--hub-url", default=None)
-    command_cancel.add_argument("--api-token", default=os.getenv("ORBIT_API_TOKEN"))
+    command_cancel.add_argument("--user-token", default=os.getenv("ORBIT_USER_TOKEN"))
+    command_cancel.add_argument("--token-expires-at", default=os.getenv("ORBIT_TOKEN_EXPIRES_AT"))
     command_cancel.add_argument("--command-id", required=True)
     command_cancel.set_defaults(func=cmd_command_cancel)
 
@@ -607,7 +686,8 @@ def build_parser() -> argparse.ArgumentParser:
     shell_sub = shell.add_subparsers(dest="shell_command", required=True)
     shell_start = shell_sub.add_parser("start", help="start a remote shell session")
     shell_start.add_argument("--hub-url", default=None)
-    shell_start.add_argument("--api-token", default=os.getenv("ORBIT_API_TOKEN"))
+    shell_start.add_argument("--user-token", default=os.getenv("ORBIT_USER_TOKEN"))
+    shell_start.add_argument("--token-expires-at", default=os.getenv("ORBIT_TOKEN_EXPIRES_AT"))
     shell_start.add_argument("--agent-id", default=None)
     shell_start.add_argument("--package-id", default=None)
     shell_start.add_argument("--poll-interval-sec", type=float, default=0.5)
@@ -616,21 +696,24 @@ def build_parser() -> argparse.ArgumentParser:
 
     shell_list = shell_sub.add_parser("list", help="list remote shell sessions")
     shell_list.add_argument("--hub-url", default=None)
-    shell_list.add_argument("--api-token", default=os.getenv("ORBIT_API_TOKEN"))
+    shell_list.add_argument("--user-token", default=os.getenv("ORBIT_USER_TOKEN"))
+    shell_list.add_argument("--token-expires-at", default=os.getenv("ORBIT_TOKEN_EXPIRES_AT"))
     shell_list.add_argument("--agent-id", default=None)
-    shell_list.add_argument("--status", choices=[status.value for status in ShellSessionStatus])
+    shell_list.add_argument("--status", choices=[item.value for item in ShellSessionStatus])
     shell_list.set_defaults(func=cmd_shell_list)
 
     shell_attach = shell_sub.add_parser("attach", help="attach to a remote shell session")
     shell_attach.add_argument("--hub-url", default=None)
-    shell_attach.add_argument("--api-token", default=os.getenv("ORBIT_API_TOKEN"))
+    shell_attach.add_argument("--user-token", default=os.getenv("ORBIT_USER_TOKEN"))
+    shell_attach.add_argument("--token-expires-at", default=os.getenv("ORBIT_TOKEN_EXPIRES_AT"))
     shell_attach.add_argument("--session-id", required=True)
     shell_attach.add_argument("--poll-interval-sec", type=float, default=0.5)
     shell_attach.set_defaults(func=cmd_shell_attach)
 
     shell_close = shell_sub.add_parser("close", help="close a remote shell session")
     shell_close.add_argument("--hub-url", default=None)
-    shell_close.add_argument("--api-token", default=os.getenv("ORBIT_API_TOKEN"))
+    shell_close.add_argument("--user-token", default=os.getenv("ORBIT_USER_TOKEN"))
+    shell_close.add_argument("--token-expires-at", default=os.getenv("ORBIT_TOKEN_EXPIRES_AT"))
     shell_close.add_argument("--session-id", required=True)
     shell_close.set_defaults(func=cmd_shell_close)
 
@@ -653,21 +736,23 @@ def prepare_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> a
     args._orbit_config = config
     _apply_config_defaults(args, config)
 
-    if args.command == "package" and args.package_command == "upload":
+    if args.command == "connect":
         _validate_required(parser, args, "hub_url")
+    if args.command == "package" and args.package_command == "upload":
+        _validate_required(parser, args, "hub_url", "user_token", "token_expires_at")
     if args.command == "command" and args.command_command == "exec":
-        _validate_required(parser, args, "hub_url", "agent_id")
+        _validate_required(parser, args, "hub_url", "user_token", "token_expires_at", "agent_id")
         argv = list(args.command_argv or [])
         if argv and argv[0] == "--":
             argv = argv[1:]
         if not argv:
             parser.error("command exec requires a trailing command, for example: orbit command exec --agent-id agent-a python3 -V")
     if args.command == "command" and args.command_command in {"status", "output", "cancel"}:
-        _validate_required(parser, args, "hub_url")
+        _validate_required(parser, args, "hub_url", "user_token", "token_expires_at")
     if args.command == "shell" and args.shell_command == "start":
-        _validate_required(parser, args, "hub_url", "agent_id")
+        _validate_required(parser, args, "hub_url", "user_token", "token_expires_at", "agent_id")
     if args.command == "shell" and args.shell_command in {"list", "attach", "close"}:
-        _validate_required(parser, args, "hub_url")
+        _validate_required(parser, args, "hub_url", "user_token", "token_expires_at")
     return args
 
 

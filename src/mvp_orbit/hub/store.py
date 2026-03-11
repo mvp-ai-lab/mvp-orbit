@@ -1,18 +1,23 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import secrets
 import sqlite3
-from datetime import datetime
+from dataclasses import dataclass
+from datetime import datetime, timedelta
 from pathlib import Path
 from threading import Lock
 
 from mvp_orbit.core.models import (
+    AgentRecord,
     CommandCompletionRequest,
     CommandCreateRequest,
     CommandLease,
     CommandOutputChunk,
     CommandRecord,
     CommandStatus,
+    ConnectResponse,
     PackageRecord,
     ShellCompletionRequest,
     ShellEvent,
@@ -20,8 +25,29 @@ from mvp_orbit.core.models import (
     ShellSessionLease,
     ShellSessionRecord,
     ShellSessionStatus,
+    UserRecord,
     utc_now,
 )
+
+TOKEN_TTL = timedelta(days=7)
+
+
+class InvalidTokenError(Exception):
+    pass
+
+
+class ExpiredTokenError(Exception):
+    pass
+
+
+class OwnershipError(Exception):
+    pass
+
+
+@dataclass(frozen=True)
+class AuthenticatedUser:
+    user_id: str
+    expires_at: datetime
 
 
 class HubStore:
@@ -43,6 +69,35 @@ class HubStore:
         with self._conn:
             self._conn.execute(
                 """
+                CREATE TABLE IF NOT EXISTS users (
+                    user_id TEXT PRIMARY KEY,
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
+            self._conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS user_tokens (
+                    token_hash TEXT PRIMARY KEY,
+                    user_id TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    revoked_at TEXT
+                )
+                """
+            )
+            self._conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS agents (
+                    agent_id TEXT PRIMARY KEY,
+                    owner_user_id TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    last_seen_at TEXT
+                )
+                """
+            )
+            self._conn.execute(
+                """
                 CREATE TABLE IF NOT EXISTS packages (
                     package_id TEXT PRIMARY KEY,
                     size INTEGER NOT NULL,
@@ -52,9 +107,20 @@ class HubStore:
             )
             self._conn.execute(
                 """
+                CREATE TABLE IF NOT EXISTS package_access (
+                    package_id TEXT NOT NULL,
+                    owner_user_id TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY (package_id, owner_user_id)
+                )
+                """
+            )
+            self._conn.execute(
+                """
                 CREATE TABLE IF NOT EXISTS commands (
                     command_id TEXT PRIMARY KEY,
                     agent_id TEXT NOT NULL,
+                    owner_user_id TEXT NOT NULL,
                     package_id TEXT,
                     argv TEXT NOT NULL,
                     env_patch TEXT NOT NULL,
@@ -78,6 +144,7 @@ class HubStore:
                 CREATE TABLE IF NOT EXISTS shell_sessions (
                     session_id TEXT PRIMARY KEY,
                     agent_id TEXT NOT NULL,
+                    owner_user_id TEXT NOT NULL,
                     package_id TEXT,
                     cwd_root TEXT NOT NULL,
                     status TEXT NOT NULL,
@@ -116,7 +183,88 @@ class HubStore:
                 """
             )
 
-    def put_package(self, package_id: str, payload: bytes) -> PackageRecord:
+    def issue_user_token(self, user_id: str) -> ConnectResponse:
+        user = self.ensure_user(user_id)
+        created_at = utc_now()
+        expires_at = created_at + TOKEN_TTL
+        user_token = secrets.token_urlsafe(32)
+        token_hash = self._hash_token(user_token)
+        with self._lock, self._conn:
+            self._conn.execute(
+                """
+                INSERT INTO user_tokens (token_hash, user_id, created_at, expires_at, revoked_at)
+                VALUES (?, ?, ?, ?, NULL)
+                """,
+                (token_hash, user.user_id, created_at.isoformat(), expires_at.isoformat()),
+            )
+        return ConnectResponse(user_id=user.user_id, user_token=user_token, expires_at=expires_at)
+
+    def ensure_user(self, user_id: str) -> UserRecord:
+        now = utc_now()
+        with self._lock, self._conn:
+            self._conn.execute(
+                """
+                INSERT INTO users (user_id, created_at)
+                VALUES (?, ?)
+                ON CONFLICT(user_id) DO NOTHING
+                """,
+                (user_id, now.isoformat()),
+            )
+            row = self._conn.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)).fetchone()
+            assert row is not None
+        return self._row_to_user(dict(row))
+
+    def authenticate_user_token(self, user_token: str) -> AuthenticatedUser:
+        token_hash = self._hash_token(user_token)
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT user_id, expires_at, revoked_at FROM user_tokens WHERE token_hash = ?",
+                (token_hash,),
+            ).fetchone()
+        if row is None or row["revoked_at"] is not None:
+            raise InvalidTokenError("invalid token")
+        expires_at = _parse_dt(row["expires_at"])
+        assert expires_at is not None
+        if expires_at <= utc_now():
+            raise ExpiredTokenError("token expired")
+        return AuthenticatedUser(user_id=str(row["user_id"]), expires_at=expires_at)
+
+    def register_agent(self, agent_id: str, owner_user_id: str) -> AgentRecord:
+        now = utc_now().isoformat()
+        with self._lock, self._conn:
+            row = self._conn.execute("SELECT * FROM agents WHERE agent_id = ?", (agent_id,)).fetchone()
+            if row is None:
+                self._conn.execute(
+                    """
+                    INSERT INTO agents (agent_id, owner_user_id, created_at, last_seen_at)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (agent_id, owner_user_id, now, now),
+                )
+            else:
+                if row["owner_user_id"] != owner_user_id:
+                    raise OwnershipError(agent_id)
+                self._conn.execute(
+                    "UPDATE agents SET last_seen_at = ? WHERE agent_id = ?",
+                    (now, agent_id),
+                )
+            updated = self._conn.execute("SELECT * FROM agents WHERE agent_id = ?", (agent_id,)).fetchone()
+            assert updated is not None
+        return self._row_to_agent(dict(updated))
+
+    def get_agent(self, agent_id: str) -> AgentRecord | None:
+        with self._lock:
+            row = self._conn.execute("SELECT * FROM agents WHERE agent_id = ?", (agent_id,)).fetchone()
+        if row is None:
+            return None
+        return self._row_to_agent(dict(row))
+
+    def assert_agent_owner(self, agent_id: str, owner_user_id: str) -> None:
+        agent = self.get_agent(agent_id)
+        if agent is None or agent.owner_user_id != owner_user_id:
+            raise OwnershipError(agent_id)
+
+    def put_package(self, package_id: str, payload: bytes, owner_user_id: str) -> PackageRecord:
         path = self.package_path(package_id)
         if not path.exists():
             path.write_bytes(payload)
@@ -130,17 +278,41 @@ class HubStore:
                 """,
                 (package_id, len(payload), now.isoformat()),
             )
+            self._conn.execute(
+                """
+                INSERT INTO package_access (package_id, owner_user_id, created_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(package_id, owner_user_id) DO NOTHING
+                """,
+                (package_id, owner_user_id, now.isoformat()),
+            )
             row = self._conn.execute("SELECT * FROM packages WHERE package_id = ?", (package_id,)).fetchone()
             assert row is not None
         return self._row_to_package(dict(row))
 
-    def get_package(self, package_id: str) -> bytes:
+    def get_package(self, package_id: str, owner_user_id: str) -> bytes:
+        with self._lock:
+            access = self._conn.execute(
+                "SELECT 1 FROM package_access WHERE package_id = ? AND owner_user_id = ?",
+                (package_id, owner_user_id),
+            ).fetchone()
+        if access is None:
+            raise OwnershipError(package_id)
         path = self.package_path(package_id)
         if not path.exists():
             raise FileNotFoundError(package_id)
         return path.read_bytes()
 
-    def create_command(self, command_id: str, request: CommandCreateRequest) -> CommandRecord:
+    def ensure_package_access(self, package_id: str, owner_user_id: str) -> None:
+        with self._lock:
+            access = self._conn.execute(
+                "SELECT 1 FROM package_access WHERE package_id = ? AND owner_user_id = ?",
+                (package_id, owner_user_id),
+            ).fetchone()
+        if access is None:
+            raise OwnershipError(package_id)
+
+    def create_command(self, command_id: str, owner_user_id: str, request: CommandCreateRequest) -> CommandRecord:
         stdout_path = self.command_output_path(command_id, "stdout")
         stderr_path = self.command_output_path(command_id, "stderr")
         stdout_path.write_text("", encoding="utf-8")
@@ -149,6 +321,7 @@ class HubStore:
         record = CommandRecord(
             command_id=command_id,
             agent_id=request.agent_id,
+            owner_user_id=owner_user_id,
             package_id=request.package_id,
             argv=request.argv,
             env_patch=request.env_patch,
@@ -163,25 +336,25 @@ class HubStore:
             self._conn.execute(
                 """
                 INSERT INTO commands (
-                    command_id, agent_id, package_id, argv, env_patch, timeout_sec, working_dir,
+                    command_id, agent_id, owner_user_id, package_id, argv, env_patch, timeout_sec, working_dir,
                     status, created_at, started_at, finished_at, heartbeat_at, cancel_requested_at,
                     exit_code, failure_code, stdout_path, stderr_path
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 self._command_values(record),
             )
         return record
 
-    def lease_next_command(self, agent_id: str) -> CommandLease | None:
+    def lease_next_command(self, agent_id: str, owner_user_id: str) -> CommandLease | None:
         with self._lock, self._conn:
             row = self._conn.execute(
                 """
                 SELECT * FROM commands
-                WHERE agent_id = ? AND status = ?
+                WHERE agent_id = ? AND owner_user_id = ? AND status = ?
                 ORDER BY created_at ASC
                 LIMIT 1
                 """,
-                (agent_id, CommandStatus.QUEUED.value),
+                (agent_id, owner_user_id, CommandStatus.QUEUED.value),
             ).fetchone()
             if row is None:
                 return None
@@ -301,10 +474,17 @@ class HubStore:
             failure_code=record.failure_code,
         )
 
-    def create_shell_session(self, session_id: str, request: ShellSessionCreateRequest, cwd_root: str) -> ShellSessionRecord:
+    def create_shell_session(
+        self,
+        session_id: str,
+        owner_user_id: str,
+        request: ShellSessionCreateRequest,
+        cwd_root: str,
+    ) -> ShellSessionRecord:
         record = ShellSessionRecord(
             session_id=session_id,
             agent_id=request.agent_id,
+            owner_user_id=owner_user_id,
             package_id=request.package_id,
             cwd_root=cwd_root,
             status=ShellSessionStatus.QUEUED,
@@ -314,24 +494,24 @@ class HubStore:
             self._conn.execute(
                 """
                 INSERT INTO shell_sessions (
-                    session_id, agent_id, package_id, cwd_root, status, created_at,
+                    session_id, agent_id, owner_user_id, package_id, cwd_root, status, created_at,
                     started_at, finished_at, heartbeat_at, close_requested_at, exit_code, failure_code
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 self._shell_values(record),
             )
         return record
 
-    def lease_next_shell_session(self, agent_id: str) -> ShellSessionLease | None:
+    def lease_next_shell_session(self, agent_id: str, owner_user_id: str) -> ShellSessionLease | None:
         with self._lock, self._conn:
             row = self._conn.execute(
                 """
                 SELECT * FROM shell_sessions
-                WHERE agent_id = ? AND status = ?
+                WHERE agent_id = ? AND owner_user_id = ? AND status = ?
                 ORDER BY created_at ASC
                 LIMIT 1
                 """,
-                (agent_id, ShellSessionStatus.QUEUED.value),
+                (agent_id, owner_user_id, ShellSessionStatus.QUEUED.value),
             ).fetchone()
             if row is None:
                 return None
@@ -344,10 +524,7 @@ class HubStore:
                 """,
                 (ShellSessionStatus.RUNNING.value, now, now, row["session_id"]),
             )
-            updated = self._conn.execute(
-                "SELECT * FROM shell_sessions WHERE session_id = ?",
-                (row["session_id"],),
-            ).fetchone()
+            updated = self._conn.execute("SELECT * FROM shell_sessions WHERE session_id = ?", (row["session_id"],)).fetchone()
             assert updated is not None
         record = self._row_to_shell(dict(updated))
         return ShellSessionLease(
@@ -481,21 +658,19 @@ class HubStore:
 
     def list_shell_sessions(
         self,
+        owner_user_id: str,
         *,
         agent_id: str | None = None,
         session_status: ShellSessionStatus | None = None,
     ) -> list[ShellSessionRecord]:
-        query = "SELECT * FROM shell_sessions"
-        clauses: list[str] = []
-        params: list[str] = []
+        query = "SELECT * FROM shell_sessions WHERE owner_user_id = ?"
+        params: list[str] = [owner_user_id]
         if agent_id is not None:
-            clauses.append("agent_id = ?")
+            query += " AND agent_id = ?"
             params.append(agent_id)
         if session_status is not None:
-            clauses.append("status = ?")
+            query += " AND status = ?"
             params.append(session_status.value)
-        if clauses:
-            query += " WHERE " + " AND ".join(clauses)
         query += " ORDER BY created_at DESC"
         with self._lock:
             rows = self._conn.execute(query, params).fetchall()
@@ -516,10 +691,15 @@ class HubStore:
             return handle.read()
 
     @staticmethod
+    def _hash_token(token: str) -> str:
+        return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+    @staticmethod
     def _command_values(record: CommandRecord) -> tuple:
         return (
             record.command_id,
             record.agent_id,
+            record.owner_user_id,
             record.package_id,
             json.dumps(record.argv),
             json.dumps(record.env_patch),
@@ -542,6 +722,7 @@ class HubStore:
         return (
             record.session_id,
             record.agent_id,
+            record.owner_user_id,
             record.package_id,
             record.cwd_root,
             record.status.value,
@@ -552,6 +733,19 @@ class HubStore:
             record.close_requested_at.isoformat() if record.close_requested_at else None,
             record.exit_code,
             record.failure_code,
+        )
+
+    @staticmethod
+    def _row_to_user(row: dict) -> UserRecord:
+        return UserRecord(user_id=row["user_id"], created_at=_parse_dt(row["created_at"]))
+
+    @staticmethod
+    def _row_to_agent(row: dict) -> AgentRecord:
+        return AgentRecord(
+            agent_id=row["agent_id"],
+            owner_user_id=row["owner_user_id"],
+            created_at=_parse_dt(row["created_at"]),
+            last_seen_at=_parse_dt(row["last_seen_at"]),
         )
 
     @staticmethod
@@ -567,6 +761,7 @@ class HubStore:
         return CommandRecord(
             command_id=row["command_id"],
             agent_id=row["agent_id"],
+            owner_user_id=row["owner_user_id"],
             package_id=row["package_id"],
             argv=json.loads(row["argv"]),
             env_patch=json.loads(row["env_patch"] or "{}"),
@@ -589,6 +784,7 @@ class HubStore:
         return ShellSessionRecord(
             session_id=row["session_id"],
             agent_id=row["agent_id"],
+            owner_user_id=row["owner_user_id"],
             package_id=row["package_id"],
             cwd_root=row["cwd_root"],
             status=ShellSessionStatus(row["status"]),

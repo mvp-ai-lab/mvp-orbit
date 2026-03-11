@@ -19,18 +19,22 @@ from mvp_orbit.core.models import (
 logger = logging.getLogger(__name__)
 
 
+class TokenExpiredError(RuntimeError):
+    pass
+
+
 @dataclass
 class AgentService:
     agent_id: str
     hub_url: str
     runtime: AgentRuntime
-    api_token: str | None = None
+    user_token: str | None = None
     poll_interval_sec: float = 5.0
 
     def _headers(self) -> dict[str, str]:
         headers = {"Accept": "application/json"}
-        if self.api_token:
-            headers["Authorization"] = f"Bearer {self.api_token}"
+        if self.user_token:
+            headers["Authorization"] = f"Bearer {self.user_token}"
         return headers
 
     def poll_once(self, client: httpx.Client | None = None) -> str:
@@ -45,6 +49,8 @@ class AgentService:
             if shell_status != "idle":
                 return shell_status
             return self._poll_command_once(client)
+        except TokenExpiredError:
+            raise
         except (httpx.RequestError, httpx.HTTPStatusError):
             return "poll_error"
         finally:
@@ -54,14 +60,18 @@ class AgentService:
     def run_forever(self) -> None:
         with httpx.Client(timeout=20) as client:
             while True:
-                self.poll_once(client=client)
+                try:
+                    self.poll_once(client=client)
+                except TokenExpiredError as exc:
+                    logger.error("agent %s token expired; run `orbit connect` again and restart the agent", self.agent_id)
+                    raise RuntimeError("token expired") from exc
                 time.sleep(self.poll_interval_sec)
 
     def _poll_command_once(self, client: httpx.Client) -> str:
         response = client.get(f"{self.hub_url}/api/agents/{self.agent_id}/commands/next", headers=self._headers())
         if response.status_code == 204:
             return "idle"
-        response.raise_for_status()
+        self._raise_for_status(response)
         lease = CommandLease.model_validate(response.json())
         logger.info(
             "agent %s leased command %s package_id=%s",
@@ -89,7 +99,7 @@ class AgentService:
         response = client.get(f"{self.hub_url}/api/agents/{self.agent_id}/shells/next", headers=self._headers())
         if response.status_code == 204:
             return "idle"
-        response.raise_for_status()
+        self._raise_for_status(response)
         lease = ShellSessionLease.model_validate(response.json())
         logger.info(
             "agent %s leased shell session %s package_id=%s",
@@ -118,7 +128,7 @@ class AgentService:
     def _fetch_package(self, client: httpx.Client, package_id: str) -> bytes:
         logger.info("agent %s requesting package %s from hub", self.agent_id, package_id)
         response = client.get(f"{self.hub_url}/api/packages/{package_id}", headers=self._headers())
-        response.raise_for_status()
+        self._raise_for_status(response)
         return response.content
 
     def _append_command_output(self, client: httpx.Client, command_id: str, stream: str, data: str) -> None:
@@ -129,7 +139,7 @@ class AgentService:
                 headers=self._headers(),
                 json=request.model_dump(mode="json"),
             )
-            response.raise_for_status()
+            self._raise_for_status(response)
         except (httpx.RequestError, httpx.HTTPStatusError) as exc:
             logger.warning(
                 "agent %s failed to append command %s %s output: %s",
@@ -141,7 +151,7 @@ class AgentService:
 
     def _command_heartbeat(self, client: httpx.Client, command_id: str) -> bool:
         response = client.post(f"{self.hub_url}/api/commands/{command_id}/heartbeat", headers=self._headers())
-        response.raise_for_status()
+        self._raise_for_status(response)
         payload = response.json()
         return payload.get("cancel_requested_at") is not None
 
@@ -156,7 +166,7 @@ class AgentService:
             headers=self._headers(),
             json=request.model_dump(mode="json"),
         )
-        response.raise_for_status()
+        self._raise_for_status(response)
 
     def _consume_shell_inputs(self, client: httpx.Client, session_id: str, after_seq: int) -> list[tuple[int, str]]:
         response = client.get(
@@ -164,7 +174,7 @@ class AgentService:
             headers=self._headers(),
             params={"after_seq": after_seq},
         )
-        response.raise_for_status()
+        self._raise_for_status(response)
         payload = response.json()
         return [(int(item["seq"]), str(item["data"])) for item in payload.get("inputs", [])]
 
@@ -176,7 +186,7 @@ class AgentService:
                 headers=self._headers(),
                 json=request.model_dump(mode="json"),
             )
-            response.raise_for_status()
+            self._raise_for_status(response)
         except (httpx.RequestError, httpx.HTTPStatusError) as exc:
             logger.warning(
                 "agent %s failed to append shell session %s %s event: %s",
@@ -188,12 +198,12 @@ class AgentService:
 
     def _shell_heartbeat(self, client: httpx.Client, session_id: str) -> bool:
         response = client.post(f"{self.hub_url}/api/shells/{session_id}/heartbeat", headers=self._headers())
-        response.raise_for_status()
+        self._raise_for_status(response)
         return True
 
     def _shell_should_close(self, client: httpx.Client, session_id: str) -> bool:
         response = client.get(f"{self.hub_url}/api/shells/{session_id}", headers=self._headers())
-        response.raise_for_status()
+        self._raise_for_status(response)
         payload = response.json()
         return payload.get("close_requested_at") is not None
 
@@ -208,4 +218,16 @@ class AgentService:
             headers=self._headers(),
             json=request.model_dump(mode="json"),
         )
+        self._raise_for_status(response)
+
+    @staticmethod
+    def _raise_for_status(response: httpx.Response) -> None:
+        if response.status_code == 401:
+            detail = None
+            try:
+                detail = response.json().get("detail")
+            except Exception:
+                detail = None
+            if detail == "token expired":
+                raise TokenExpiredError(detail)
         response.raise_for_status()
