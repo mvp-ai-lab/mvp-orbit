@@ -59,6 +59,16 @@ def test_connect_rejects_invalid_bootstrap_token(tmp_path):
     assert response.status_code == 401
 
 
+def test_root_serves_landing_page(tmp_path):
+    client, _ = _build_client(tmp_path)
+    response = client.get("/")
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/html")
+    assert "Orbit Hub Online" in response.text
+    assert "Own Agents." in response.text
+    assert "GitHub Repository" in response.text
+
+
 def test_end_to_end_command_with_package(tmp_path):
     client, _ = _build_client(tmp_path)
     alice = _connect(client, "alice")
