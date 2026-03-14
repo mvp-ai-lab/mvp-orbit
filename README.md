@@ -10,21 +10,84 @@
 
 ## Why Orbit
 
-`mvp-orbit` is designed for one specific workflow:
+`mvp-orbit` is a small HTTP-based remote execution loop for one specific workflow:
 
 1. prepare code on one machine
-2. send it to a target machine
+2. send it to another machine
 3. execute commands there
 4. stream output back immediately
-5. especially you cannot use SSH for some reason, or want something more repeatable than copy-paste
 
-That makes it a good fit for:
+It is especially useful when SSH is unavailable, inconvenient, or too manual for repeated workflows.
+
+Typical use cases:
 
 - AI coding agents that need remote execution
-- GPU/NPU/embedded debug loops
-- build-on-one-box, run-on-another workflows
+- GPU / NPU / embedded debug loops
+- build on one machine, run on another
 
-## Product Model
+## Roles
+
+Orbit has three decoupled roles:
+
+- `Hub`
+  The control plane. It stores packages, commands, shell sessions, tokens, and ownership metadata.
+- `Agent`
+  The execution side. An Agent polls the Hub for work and runs commands on its own machine.
+- `User`
+  The control side. A user sends commands to the Hub and targets a specific Agent.
+
+```mermaid
+flowchart LR
+    U["User<br/>control side"]
+    H["Hub<br/>control plane"]
+    A["Agent<br/>execution side"]
+
+    U -->|"orbit connect<br/>bootstrap_token -> user_token"| H
+    U -->|"package upload<br/>command exec<br/>shell start"| H
+    A -->|"poll commands and shells<br/>with user_token"| H
+    H -->|lease command or shell session| A
+    A -->|"stdout stderr heartbeat<br/>completion events"| H
+    H -->|"command output<br/>shell events"| U
+```
+
+This means the Hub can run on a dedicated server. The only required network condition is:
+
+- the User machine can reach the Hub over HTTP
+- the Agent machine can reach the Hub over HTTP
+
+The User and Agent do not need direct connectivity to each other.
+
+## Ownership And Auth
+
+Every Agent belongs to exactly one `user_id`.
+
+- The first successful Agent poll registers that `agent_id` under the current user.
+- Only the same user can submit commands to that Agent, open shells on it, or read its outputs.
+- Agents owned by different users are isolated and cannot be mixed.
+- Package access is also isolated per user, even when two users upload identical bytes and receive the same `package_id`.
+
+Orbit uses two token types:
+
+- `bootstrap_token`
+  A Hub-side bootstrap credential used only by `orbit connect`.
+- `user_token`
+  The runtime credential used by both the User-side CLI and the Agent when talking to the Hub API.
+
+In normal operation, all Hub API calls use `user_token`.
+
+The `bootstrap_token` is only used to mint a 7-day `user_token`:
+
+```text
+bootstrap_token -> orbit connect -> user_token -> normal Hub API traffic
+```
+
+Important notes:
+
+- The control machine and the Agent machine do not need to share the exact same token string.
+- They do need tokens that belong to the same `user_id` if that user should control that Agent.
+- `orbit init node` uses or updates `user_token` and `expires_at` in local config. In practice those values often come from a previous `orbit connect`.
+
+## Runtime Model
 
 Orbit is built around three user-facing actions:
 
@@ -42,54 +105,58 @@ Key runtime semantics:
 - Commands with `package_id` run in a package-specific subdirectory under the base workspace.
 - Shell sessions start in the base workspace by default, or in the package workspace when `package_id` is provided.
 - Hub, CLI, and Agent communicate using HTTP + Bearer token only.
-- `orbit connect` exchanges a Hub bootstrap token for a 7-day user token.
-- A user token can control only that user's Agents and resources.
 
 ## Quick Start
 
-### 1. Initialize the Hub
+### 1. Start the Hub
+
+On the Hub machine:
 
 ```bash
 orbit init hub
 orbit hub serve
 ```
 
-`orbit init hub` prints:
-
-- the Hub URL
-- the bootstrap token used by `orbit connect`
-
-Build and run the Hub with Docker:
-
-```bash
-docker build -t mvp-orbit-hub .
-docker run --rm -p 8080:8080 \
-  -e ORBIT_BOOTSTRAP_TOKEN=your-bootstrap-token \
-  -v "$PWD/orbit-data:/var/lib/orbit" \
-  mvp-orbit-hub
-```
+`orbit init hub` writes Hub config and prints the bootstrap token used by `orbit connect`.
 
 ### 2. Connect as a user
+
+On the user (development) machine:
 
 ```bash
 orbit connect --hub-url http://127.0.0.1:8080
 ```
 
-`orbit connect` writes a 7-day `user_token` and `expires_at` into your local config.
+`orbit connect` asks for:
 
-### 3. Initialize a node / Agent
+- the Hub URL
+- a `user_id`
+- the Hub `bootstrap_token`
+
+It then writes `user_token` and `expires_at` into local config.
+
+If the same user should control an Agent, the Agent machine should also have a valid token for the same `user_id`.
+
+### 3. Initialize and run the Agent
+
+On the agent (execution) machine:
 
 ```bash
 orbit init node --agent-id agent-a
-```
-
-Then start the Agent:
-
-```bash
 orbit agent run
 ```
 
-## Core Flows
+`orbit init node` configures:
+
+- the Hub URL
+- `user_token`
+- `expires_at`
+- `agent_id`
+- workspace and polling settings
+
+When the Agent starts polling successfully, that `agent_id` becomes owned by the current user.
+
+## Common Flows
 
 ### Upload a package
 
@@ -107,21 +174,21 @@ Example response:
 }
 ```
 
-### Execute a command against a package
+### Execute in the Agent base workspace
+
+```bash
+orbit command exec \
+  --agent-id agent-a \
+  -- pwd
+```
+
+### Execute against an uploaded package
 
 ```bash
 orbit command exec \
   --agent-id agent-a \
   --package-id <PACKAGE_ID> \
-  python3 train.py --epochs 1
-```
-
-### Execute a command directly in the Agent base workspace
-
-```bash
-orbit command exec \
-  --agent-id agent-a \
-  bash -lc 'pwd && ls'
+  -- python3 train.py --epochs 1
 ```
 
 ### Execute a compound shell command
@@ -130,13 +197,16 @@ orbit command exec \
 orbit command exec \
   --agent-id agent-a \
   --shell \
-  "cd /cache/models/ && HF_TOKEN=hf_xxx hf download repo --local-dir model-dir"
+  "cd /cache/models && HF_TOKEN=hf_xxx hf download repo --local-dir model-dir"
 ```
 
-Notes:
+Use `--shell` when the remote command needs shell features such as:
 
-- If your remote command contains `cd`, `&&`, pipes, redirects, or inline env assignments, send it as one quoted string.
-- Unquoted `&&` is consumed by your local shell before `orbit` starts, so the latter half would run locally.
+- `cd`
+- `&&`
+- pipes
+- redirects
+- inline environment assignments
 
 ### Submit without waiting
 
@@ -145,7 +215,7 @@ orbit command exec \
   --agent-id agent-a \
   --package-id <PACKAGE_ID> \
   --detach \
-  python3 train.py
+  -- python3 train.py
 ```
 
 Then inspect it later:
@@ -171,7 +241,7 @@ Package workspace:
 orbit shell start --agent-id agent-a --package-id <PACKAGE_ID>
 ```
 
-Reconnect or close:
+Manage sessions:
 
 ```bash
 orbit shell list
@@ -182,9 +252,8 @@ orbit shell close --session-id <SESSION_ID>
 
 While attached locally:
 
-- `/detach` keeps the remote shell alive and disconnects your local session
+- `/detach` disconnects the local client but keeps the remote shell alive
 - `/close` closes the remote shell
-- `shell start` prints the new `session_id` before attaching so you can reattach or close it later
 
 ## Configuration
 
@@ -205,8 +274,8 @@ object_root = "./.orbit-hub/objects"
 url = "http://127.0.0.1:8080"
 
 [auth]
-bootstrap_token = "..."  # hub only
-user_token = "..."       # user/agent only
+bootstrap_token = "..."  # (optional on hub host) used by orbit connect
+user_token = "..."       # used by CLI and Agent runtime
 expires_at = "2026-03-18T12:34:56+00:00"
 
 [agent]
