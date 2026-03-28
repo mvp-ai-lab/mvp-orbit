@@ -1,25 +1,26 @@
 from __future__ import annotations
 
+import fcntl
 import io
 import logging
 import os
+import pty
+import select
+import selectors
 import shlex
 import shutil
+import signal
+import struct
 import subprocess
 import tarfile
-import threading
+import termios
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
 from mvp_orbit.core.canonical import require_matching_object_id
-from mvp_orbit.core.models import (
-    CommandLease,
-    CommandStatus,
-    ShellSessionLease,
-    ShellSessionStatus,
-)
+from mvp_orbit.core.models import CommandLease, CommandStatus, ShellSessionLease, ShellSessionStatus
 
 logger = logging.getLogger(__name__)
 
@@ -38,84 +39,32 @@ class ShellExecutionOutcome:
     failure_code: str | None = None
 
 
-class _ChunkedOutputForwarder:
-    def __init__(
-        self,
-        callback: Callable[[str, str], None],
-        *,
-        flush_bytes: int,
-        flush_interval_sec: float,
-    ) -> None:
-        self._callback = callback
-        self._flush_bytes = max(1, flush_bytes)
-        self._flush_interval_sec = max(0.01, flush_interval_sec)
-        self._buffers = {"stdout": [], "stderr": []}
-        self._sizes = {"stdout": 0, "stderr": 0}
-        self._lock = threading.Lock()
-        self._stop = threading.Event()
-        self._thread = threading.Thread(target=self._flush_loop, daemon=True)
-        self._thread.start()
-
-    def write(self, stream: str, data: str) -> None:
-        payload: str | None = None
-        with self._lock:
-            self._buffers[stream].append(data)
-            self._sizes[stream] += len(data)
-            if self._sizes[stream] >= self._flush_bytes:
-                payload = "".join(self._buffers[stream])
-                self._buffers[stream] = []
-                self._sizes[stream] = 0
-        if payload:
-            self._callback(stream, payload)
-
-    def close(self) -> None:
-        self._stop.set()
-        self._thread.join(timeout=1)
-        self.flush_all()
-
-    def flush_all(self) -> None:
-        pending: list[tuple[str, str]] = []
-        with self._lock:
-            for stream in ("stdout", "stderr"):
-                if not self._buffers[stream]:
-                    continue
-                pending.append((stream, "".join(self._buffers[stream])))
-                self._buffers[stream] = []
-                self._sizes[stream] = 0
-        for stream, payload in pending:
-            self._callback(stream, payload)
-
-    def _flush_loop(self) -> None:
-        while not self._stop.wait(self._flush_interval_sec):
-            self.flush_all()
-
-
 class AgentRuntime:
     def __init__(
         self,
         *,
         agent_id: str,
         base_workspace: str | Path,
-        heartbeat_interval_sec: float = 5.0,
-        command_output_chunk_bytes: int = 16384,
-        command_output_flush_interval_sec: float = 10.0,
+        heartbeat_interval_sec: float | None = None,
+        command_output_chunk_bytes: int = 4096,
+        command_output_flush_interval_sec: float = 0.1,
     ) -> None:
         self.agent_id = agent_id
         self.base_workspace = Path(base_workspace).resolve()
         self.base_workspace.mkdir(parents=True, exist_ok=True)
         self.packages_root = self.base_workspace / ".orbit" / "packages"
         self.packages_root.mkdir(parents=True, exist_ok=True)
-        self.heartbeat_interval_sec = heartbeat_interval_sec
-        self.command_output_chunk_bytes = command_output_chunk_bytes
-        self.command_output_flush_interval_sec = command_output_flush_interval_sec
+        self.command_output_chunk_bytes = max(64, command_output_chunk_bytes)
+        self.command_output_flush_interval_sec = max(0.01, command_output_flush_interval_sec)
 
     def handle_command(
         self,
         lease: CommandLease,
         *,
         fetch_package: Callable[[str], bytes],
+        on_started: Callable[[], None],
         append_output: Callable[[str, str], None],
-        heartbeat: Callable[[], bool],
+        should_cancel: Callable[[], bool],
     ) -> CommandExecutionOutcome:
         workspace = self._command_workspace(lease, fetch_package)
         cwd = self._resolve_working_dir(workspace, lease.working_dir)
@@ -135,75 +84,59 @@ class AgentRuntime:
             env=env,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            bufsize=1,
+            text=False,
+            bufsize=0,
+            start_new_session=True,
         )
         assert proc.stdout is not None
         assert proc.stderr is not None
-        output_forwarder = _ChunkedOutputForwarder(
-            append_output,
-            flush_bytes=self.command_output_chunk_bytes,
-            flush_interval_sec=self.command_output_flush_interval_sec,
-        )
+        on_started()
 
-        stdout_thread = threading.Thread(
-            target=self._stream_reader,
-            args=(proc.stdout, "stdout", output_forwarder.write),
-            daemon=True,
-        )
-        stderr_thread = threading.Thread(
-            target=self._stream_reader,
-            args=(proc.stderr, "stderr", output_forwarder.write),
-            daemon=True,
-        )
-        stdout_thread.start()
-        stderr_thread.start()
+        selector = selectors.DefaultSelector()
+        selector.register(proc.stdout, selectors.EVENT_READ, "stdout")
+        selector.register(proc.stderr, selectors.EVENT_READ, "stderr")
 
         deadline = time.monotonic() + lease.timeout_sec
-        next_heartbeat = time.monotonic()
         canceled = False
         timed_out = False
-        return_code = 0
-        while True:
-            if time.monotonic() >= next_heartbeat:
-                canceled = heartbeat()
-                next_heartbeat = time.monotonic() + self.heartbeat_interval_sec
-                if canceled:
-                    return_code = self._terminate_process(proc)
+        try:
+            while True:
+                if should_cancel():
+                    canceled = True
+                    self._terminate_process(proc)
+                    break
+                if time.monotonic() >= deadline:
+                    timed_out = True
+                    proc.kill()
+                    proc.wait()
                     break
 
-            polled = proc.poll()
-            if polled is not None:
-                return_code = polled
-                break
-            if time.monotonic() >= deadline:
-                timed_out = True
-                proc.kill()
-                proc.wait()
-                return_code = -1
-                break
-            time.sleep(0.2)
+                for key, _ in selector.select(timeout=self.command_output_flush_interval_sec):
+                    chunk = os.read(key.fileobj.fileno(), self.command_output_chunk_bytes)
+                    if not chunk:
+                        try:
+                            selector.unregister(key.fileobj)
+                        except Exception:
+                            pass
+                        continue
+                    append_output(key.data, chunk.decode("utf-8", errors="replace"))
 
-        stdout_thread.join(timeout=2)
-        stderr_thread.join(timeout=2)
-        output_forwarder.close()
+                if proc.poll() is not None and not selector.get_map():
+                    break
+        finally:
+            selector.close()
+            for handle in (proc.stdout, proc.stderr):
+                try:
+                    handle.close()
+                except Exception:
+                    pass
 
+        return_code = proc.wait()
         if canceled:
-            logger.info("agent %s canceled command %s exit_code=%s", self.agent_id, lease.command_id, return_code)
             return CommandExecutionOutcome(status=CommandStatus.CANCELED, exit_code=return_code, failure_code="canceled")
         if timed_out:
-            logger.warning("agent %s timed out command %s", self.agent_id, lease.command_id)
             return CommandExecutionOutcome(status=CommandStatus.FAILED, exit_code=return_code, failure_code="timeout")
         status = CommandStatus.SUCCEEDED if return_code == 0 else CommandStatus.FAILED
-        logger.info(
-            "agent %s finished command %s status=%s exit_code=%s",
-            self.agent_id,
-            lease.command_id,
-            status.value,
-            return_code,
-        )
         return CommandExecutionOutcome(status=status, exit_code=return_code)
 
     def handle_shell_session(
@@ -211,9 +144,10 @@ class AgentRuntime:
         lease: ShellSessionLease,
         *,
         fetch_package: Callable[[str], bytes],
-        get_inputs: Callable[[int], list[tuple[int, str]]],
-        append_event: Callable[[str, str], None],
-        heartbeat: Callable[[], bool],
+        on_started: Callable[[], None],
+        append_output: Callable[[str], None],
+        pop_input: Callable[[], list[bytes]],
+        pop_resize: Callable[[], list[tuple[int, int]]],
         should_close: Callable[[], bool],
     ) -> ShellExecutionOutcome:
         workspace = self._shell_workspace(lease, fetch_package)
@@ -224,89 +158,72 @@ class AgentRuntime:
             workspace,
             lease.package_id or "-",
         )
+        master_fd, slave_fd = pty.openpty()
         proc = subprocess.Popen(
             self._shell_argv(),
             cwd=str(workspace),
             env=self._merged_env({}),
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            bufsize=1,
+            stdin=slave_fd,
+            stdout=slave_fd,
+            stderr=slave_fd,
+            text=False,
+            start_new_session=True,
+            close_fds=True,
         )
-        assert proc.stdin is not None
-        assert proc.stdout is not None
-        assert proc.stderr is not None
+        os.close(slave_fd)
+        self._set_nonblocking(master_fd)
+        on_started()
 
-        stdout_thread = threading.Thread(
-            target=self._stream_reader,
-            args=(proc.stdout, "stdout", append_event),
-            daemon=True,
-        )
-        stderr_thread = threading.Thread(
-            target=self._stream_reader,
-            args=(proc.stderr, "stderr", append_event),
-            daemon=True,
-        )
-        stdout_thread.start()
-        stderr_thread.start()
+        try:
+            while True:
+                for rows, cols in pop_resize():
+                    self._set_winsize(master_fd, rows, cols)
 
-        next_input_seq = 0
-        next_heartbeat = time.monotonic()
-        while True:
-            if time.monotonic() >= next_heartbeat:
-                heartbeat()
-                next_heartbeat = time.monotonic() + self.heartbeat_interval_sec
+                for data in pop_input():
+                    if data:
+                        os.write(master_fd, data)
 
-            for seq, data in get_inputs(next_input_seq):
-                logger.info(
-                    "agent %s shell session %s input seq=%s command=%r",
-                    self.agent_id,
-                    lease.session_id,
-                    seq,
-                    self._input_preview(data),
-                )
-                proc.stdin.write(data)
-                proc.stdin.flush()
-                next_input_seq = seq
+                if should_close():
+                    try:
+                        os.write(master_fd, b"exit\n")
+                    except OSError:
+                        pass
+                    try:
+                        return_code = proc.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        return_code = self._terminate_process(proc)
+                    status = ShellSessionStatus.CLOSED if return_code == 0 else ShellSessionStatus.FAILED
+                    failure = None if return_code == 0 else "closed"
+                    return ShellExecutionOutcome(status=status, exit_code=return_code, failure_code=failure)
 
-            polled = proc.poll()
-            if polled is not None:
-                stdout_thread.join(timeout=2)
-                stderr_thread.join(timeout=2)
-                status = ShellSessionStatus.CLOSED if polled == 0 else ShellSessionStatus.FAILED
-                logger.info(
-                    "agent %s finished shell session %s status=%s exit_code=%s",
-                    self.agent_id,
-                    lease.session_id,
-                    status.value,
-                    polled,
-                )
-                return ShellExecutionOutcome(status=status, exit_code=polled)
+                ready, _, _ = select.select([master_fd], [], [], 0.05)
+                if ready:
+                    try:
+                        chunk = os.read(master_fd, 4096)
+                    except BlockingIOError:
+                        chunk = b""
+                    except OSError:
+                        chunk = b""
+                    if chunk:
+                        append_output(chunk.decode("utf-8", errors="replace"))
 
-            if should_close():
-                logger.info("agent %s closing shell session %s on request", self.agent_id, lease.session_id)
-                proc.stdin.write("exit\n")
-                proc.stdin.flush()
-                try:
-                    return_code = proc.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    return_code = self._terminate_process(proc)
-                stdout_thread.join(timeout=2)
-                stderr_thread.join(timeout=2)
-                status = ShellSessionStatus.CLOSED if return_code == 0 else ShellSessionStatus.FAILED
-                failure = None if return_code == 0 else "closed"
-                logger.info(
-                    "agent %s closed shell session %s status=%s exit_code=%s",
-                    self.agent_id,
-                    lease.session_id,
-                    status.value,
-                    return_code,
-                )
-                return ShellExecutionOutcome(status=status, exit_code=return_code, failure_code=failure)
-            time.sleep(0.2)
+                polled = proc.poll()
+                if polled is not None:
+                    try:
+                        while True:
+                            chunk = os.read(master_fd, 4096)
+                            if not chunk:
+                                break
+                            append_output(chunk.decode("utf-8", errors="replace"))
+                    except OSError:
+                        pass
+                    status = ShellSessionStatus.CLOSED if polled == 0 else ShellSessionStatus.FAILED
+                    return ShellExecutionOutcome(status=status, exit_code=polled)
+        finally:
+            try:
+                os.close(master_fd)
+            except OSError:
+                pass
 
     def _command_workspace(self, lease: CommandLease, fetch_package: Callable[[str], bytes]) -> Path:
         if lease.package_id is None:
@@ -322,10 +239,8 @@ class AgentRuntime:
         workspace = self.packages_root / package_id
         marker = workspace / ".orbit-ready"
         if marker.exists():
-            logger.info("agent %s reusing package %s in %s", self.agent_id, package_id, workspace)
             return workspace
 
-        logger.info("agent %s downloading package %s into %s", self.agent_id, package_id, workspace)
         package_bytes = fetch_package(package_id)
         require_matching_object_id(package_id, package_bytes)
         if workspace.exists():
@@ -334,7 +249,6 @@ class AgentRuntime:
         with tarfile.open(fileobj=io.BytesIO(package_bytes), mode="r:gz") as tar:
             self._extract_safely(tar, workspace)
         marker.write_text("ready\n", encoding="utf-8")
-        logger.info("agent %s prepared package %s in %s", self.agent_id, package_id, workspace)
         return workspace
 
     def _resolve_working_dir(self, workspace: Path, working_dir: str) -> Path:
@@ -345,29 +259,25 @@ class AgentRuntime:
         cwd.mkdir(parents=True, exist_ok=True)
         return cwd
 
-    def _merged_env(self, patch: dict[str, str]) -> dict[str, str]:
+    @staticmethod
+    def _merged_env(patch: dict[str, str]) -> dict[str, str]:
         env = os.environ.copy()
         env.update(patch)
         return env
 
     @staticmethod
-    def _stream_reader(handle, stream: str, callback: Callable[[str, str], None]) -> None:
-        try:
-            while True:
-                chunk = handle.readline()
-                if chunk == "":
-                    break
-                callback(stream, chunk)
-        finally:
-            handle.close()
-
-    @staticmethod
     def _terminate_process(proc: subprocess.Popen) -> int:
-        proc.terminate()
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+        except OSError:
+            proc.terminate()
         try:
             return proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
-            proc.kill()
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except OSError:
+                proc.kill()
             return proc.wait()
 
     @staticmethod
@@ -377,13 +287,14 @@ class AgentRuntime:
         return ["/bin/sh", "-i"]
 
     @staticmethod
-    def _input_preview(data: str) -> str:
-        preview = data.strip()
-        if not preview:
-            return "<empty>"
-        if len(preview) > 120:
-            return f"{preview[:117]}..."
-        return preview
+    def _set_nonblocking(fd: int) -> None:
+        flags = fcntl.fcntl(fd, fcntl.F_GETFL)
+        fcntl.fcntl(fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+
+    @staticmethod
+    def _set_winsize(fd: int, rows: int, cols: int) -> None:
+        winsize = struct.pack("HHHH", rows, cols, 0, 0)
+        fcntl.ioctl(fd, termios.TIOCSWINSZ, winsize)
 
     @staticmethod
     def _extract_safely(tar: tarfile.TarFile, destination: Path) -> None:

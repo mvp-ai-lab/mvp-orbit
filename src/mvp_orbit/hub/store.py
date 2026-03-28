@@ -7,20 +7,20 @@ import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
-from threading import Lock
+from threading import Condition, Lock
 
 from mvp_orbit.core.models import (
+    AgentControlEvent,
+    AgentEvent,
     AgentRecord,
-    CommandCompletionRequest,
     CommandCreateRequest,
     CommandLease,
     CommandOutputChunk,
     CommandRecord,
     CommandStatus,
     ConnectResponse,
+    EventRecord,
     PackageRecord,
-    ShellCompletionRequest,
-    ShellEvent,
     ShellSessionCreateRequest,
     ShellSessionLease,
     ShellSessionRecord,
@@ -61,6 +61,7 @@ class HubStore:
         self.packages_root.mkdir(parents=True, exist_ok=True)
         self.commands_root.mkdir(parents=True, exist_ok=True)
         self._lock = Lock()
+        self._updates = Condition()
         self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._init_schema()
@@ -160,28 +161,44 @@ class HubStore:
             )
             self._conn.execute(
                 """
-                CREATE TABLE IF NOT EXISTS shell_inputs (
-                    session_id TEXT NOT NULL,
+                CREATE TABLE IF NOT EXISTS agent_control_events (
+                    agent_id TEXT NOT NULL,
                     seq INTEGER NOT NULL,
-                    data TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
                     created_at TEXT NOT NULL,
-                    consumed_at TEXT,
-                    PRIMARY KEY (session_id, seq)
+                    PRIMARY KEY (agent_id, seq)
                 )
                 """
             )
             self._conn.execute(
                 """
-                CREATE TABLE IF NOT EXISTS shell_events (
+                CREATE TABLE IF NOT EXISTS command_events (
+                    command_id TEXT NOT NULL,
+                    seq INTEGER NOT NULL,
+                    kind TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY (command_id, seq)
+                )
+                """
+            )
+            self._conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS shell_stream_events (
                     session_id TEXT NOT NULL,
                     seq INTEGER NOT NULL,
-                    stream TEXT NOT NULL,
-                    data TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     PRIMARY KEY (session_id, seq)
                 )
                 """
             )
+
+    def wait_for_updates(self, timeout: float) -> bool:
+        with self._updates:
+            return self._updates.wait(timeout=timeout)
 
     def issue_user_token(self, user_id: str) -> ConnectResponse:
         user = self.ensure_user(user_id)
@@ -244,10 +261,7 @@ class HubStore:
             else:
                 if row["owner_user_id"] != owner_user_id:
                     raise OwnershipError(agent_id)
-                self._conn.execute(
-                    "UPDATE agents SET last_seen_at = ? WHERE agent_id = ?",
-                    (now, agent_id),
-                )
+                self._conn.execute("UPDATE agents SET last_seen_at = ? WHERE agent_id = ?", (now, agent_id))
             updated = self._conn.execute("SELECT * FROM agents WHERE agent_id = ?", (agent_id,)).fetchone()
             assert updated is not None
         return self._row_to_agent(dict(updated))
@@ -343,21 +357,22 @@ class HubStore:
                 """,
                 self._command_values(record),
             )
+            self._append_agent_control_event_locked(
+                request.agent_id,
+                "command.start",
+                {"command_id": command_id},
+            )
+        self._notify_update()
         return record
 
-    def lease_next_command(self, agent_id: str, owner_user_id: str) -> CommandLease | None:
+    def claim_command(self, command_id: str) -> CommandLease:
         with self._lock, self._conn:
-            row = self._conn.execute(
-                """
-                SELECT * FROM commands
-                WHERE agent_id = ? AND owner_user_id = ? AND status = ?
-                ORDER BY created_at ASC
-                LIMIT 1
-                """,
-                (agent_id, owner_user_id, CommandStatus.QUEUED.value),
-            ).fetchone()
+            row = self._conn.execute("SELECT * FROM commands WHERE command_id = ?", (command_id,)).fetchone()
             if row is None:
-                return None
+                raise KeyError(command_id)
+            record = self._row_to_command(dict(row))
+            if record.status != CommandStatus.QUEUED:
+                raise ValueError(f"command not claimable: {record.status.value}")
             now = utc_now().isoformat()
             self._conn.execute(
                 """
@@ -365,57 +380,20 @@ class HubStore:
                 SET status = ?, started_at = ?, heartbeat_at = ?
                 WHERE command_id = ?
                 """,
-                (CommandStatus.RUNNING.value, now, now, row["command_id"]),
+                (CommandStatus.RUNNING.value, now, now, command_id),
             )
-            updated = self._conn.execute("SELECT * FROM commands WHERE command_id = ?", (row["command_id"],)).fetchone()
+            updated = self._conn.execute("SELECT * FROM commands WHERE command_id = ?", (command_id,)).fetchone()
             assert updated is not None
-        record = self._row_to_command(dict(updated))
+        updated_record = self._row_to_command(dict(updated))
         return CommandLease(
-            command_id=record.command_id,
-            agent_id=record.agent_id,
-            package_id=record.package_id,
-            argv=record.argv,
-            env_patch=record.env_patch,
-            timeout_sec=record.timeout_sec,
-            working_dir=record.working_dir,
+            command_id=updated_record.command_id,
+            agent_id=updated_record.agent_id,
+            package_id=updated_record.package_id,
+            argv=updated_record.argv,
+            env_patch=updated_record.env_patch,
+            timeout_sec=updated_record.timeout_sec,
+            working_dir=updated_record.working_dir,
         )
-
-    def heartbeat_command(self, command_id: str) -> CommandRecord:
-        now = utc_now().isoformat()
-        with self._lock, self._conn:
-            updated = self._conn.execute(
-                "UPDATE commands SET heartbeat_at = ? WHERE command_id = ?",
-                (now, command_id),
-            )
-            if updated.rowcount == 0:
-                raise KeyError(command_id)
-            row = self._conn.execute("SELECT * FROM commands WHERE command_id = ?", (command_id,)).fetchone()
-            assert row is not None
-        return self._row_to_command(dict(row))
-
-    def append_command_output(self, command_id: str, stream: str, data: str) -> None:
-        path = self.command_output_path(command_id, stream)
-        if not path.exists():
-            raise KeyError(command_id)
-        with path.open("a", encoding="utf-8") as handle:
-            handle.write(data)
-
-    def complete_command(self, command_id: str, request: CommandCompletionRequest) -> CommandRecord:
-        finished = utc_now().isoformat()
-        with self._lock, self._conn:
-            updated = self._conn.execute(
-                """
-                UPDATE commands
-                SET status = ?, finished_at = ?, exit_code = ?, failure_code = ?
-                WHERE command_id = ?
-                """,
-                (request.status.value, finished, request.exit_code, request.failure_code, command_id),
-            )
-            if updated.rowcount == 0:
-                raise KeyError(command_id)
-            row = self._conn.execute("SELECT * FROM commands WHERE command_id = ?", (command_id,)).fetchone()
-            assert row is not None
-        return self._row_to_command(dict(row))
 
     def cancel_command(self, command_id: str) -> CommandRecord:
         now = utc_now().isoformat()
@@ -435,13 +413,19 @@ class HubStore:
                     """,
                     (CommandStatus.CANCELED.value, now, now, -15, "canceled", command_id),
                 )
+                payload = {
+                    "command_id": command_id,
+                    "status": CommandStatus.CANCELED.value,
+                    "exit_code": -15,
+                    "failure_code": "canceled",
+                }
+                self._append_command_event_locked(command_id, "command.exit", payload)
             else:
-                self._conn.execute(
-                    "UPDATE commands SET cancel_requested_at = ? WHERE command_id = ?",
-                    (now, command_id),
-                )
+                self._conn.execute("UPDATE commands SET cancel_requested_at = ? WHERE command_id = ?", (now, command_id))
+                self._append_agent_control_event_locked(record.agent_id, "command.cancel", {"command_id": command_id})
             updated = self._conn.execute("SELECT * FROM commands WHERE command_id = ?", (command_id,)).fetchone()
             assert updated is not None
+        self._notify_update()
         return self._row_to_command(dict(updated))
 
     def get_command(self, command_id: str) -> CommandRecord | None:
@@ -500,21 +484,22 @@ class HubStore:
                 """,
                 self._shell_values(record),
             )
+            self._append_agent_control_event_locked(
+                request.agent_id,
+                "shell.start",
+                {"session_id": session_id},
+            )
+        self._notify_update()
         return record
 
-    def lease_next_shell_session(self, agent_id: str, owner_user_id: str) -> ShellSessionLease | None:
+    def claim_shell_session(self, session_id: str) -> ShellSessionLease:
         with self._lock, self._conn:
-            row = self._conn.execute(
-                """
-                SELECT * FROM shell_sessions
-                WHERE agent_id = ? AND owner_user_id = ? AND status = ?
-                ORDER BY created_at ASC
-                LIMIT 1
-                """,
-                (agent_id, owner_user_id, ShellSessionStatus.QUEUED.value),
-            ).fetchone()
+            row = self._conn.execute("SELECT * FROM shell_sessions WHERE session_id = ?", (session_id,)).fetchone()
             if row is None:
-                return None
+                raise KeyError(session_id)
+            record = self._row_to_shell(dict(row))
+            if record.status != ShellSessionStatus.QUEUED:
+                raise ValueError(f"shell not claimable: {record.status.value}")
             now = utc_now().isoformat()
             self._conn.execute(
                 """
@@ -522,132 +507,76 @@ class HubStore:
                 SET status = ?, started_at = ?, heartbeat_at = ?
                 WHERE session_id = ?
                 """,
-                (ShellSessionStatus.RUNNING.value, now, now, row["session_id"]),
+                (ShellSessionStatus.RUNNING.value, now, now, session_id),
             )
-            updated = self._conn.execute("SELECT * FROM shell_sessions WHERE session_id = ?", (row["session_id"],)).fetchone()
+            updated = self._conn.execute("SELECT * FROM shell_sessions WHERE session_id = ?", (session_id,)).fetchone()
             assert updated is not None
-        record = self._row_to_shell(dict(updated))
+        updated_record = self._row_to_shell(dict(updated))
         return ShellSessionLease(
-            session_id=record.session_id,
-            agent_id=record.agent_id,
-            package_id=record.package_id,
-            cwd_root=record.cwd_root,
+            session_id=updated_record.session_id,
+            agent_id=updated_record.agent_id,
+            package_id=updated_record.package_id,
+            cwd_root=updated_record.cwd_root,
         )
 
-    def heartbeat_shell_session(self, session_id: str) -> ShellSessionRecord:
-        now = utc_now().isoformat()
-        with self._lock, self._conn:
-            updated = self._conn.execute(
-                "UPDATE shell_sessions SET heartbeat_at = ? WHERE session_id = ?",
-                (now, session_id),
-            )
-            if updated.rowcount == 0:
-                raise KeyError(session_id)
-            row = self._conn.execute("SELECT * FROM shell_sessions WHERE session_id = ?", (session_id,)).fetchone()
-            assert row is not None
-        return self._row_to_shell(dict(row))
-
     def append_shell_input(self, session_id: str, data: str) -> int:
-        now = utc_now()
         with self._lock, self._conn:
-            seq_row = self._conn.execute(
-                "SELECT COALESCE(MAX(seq), 0) AS max_seq FROM shell_inputs WHERE session_id = ?",
-                (session_id,),
-            ).fetchone()
-            seq = int(seq_row["max_seq"]) + 1
-            self._conn.execute(
-                """
-                INSERT INTO shell_inputs (session_id, seq, data, created_at, consumed_at)
-                VALUES (?, ?, ?, ?, NULL)
-                """,
-                (session_id, seq, data, now.isoformat()),
+            row = self._conn.execute("SELECT * FROM shell_sessions WHERE session_id = ?", (session_id,)).fetchone()
+            if row is None:
+                raise KeyError(session_id)
+            record = self._row_to_shell(dict(row))
+            event = self._append_agent_control_event_locked(
+                record.agent_id,
+                "shell.stdin",
+                {"session_id": session_id, "data": data},
             )
-        return seq
+        self._notify_update()
+        return event.event_id
 
-    def consume_shell_inputs(self, session_id: str, after_seq: int) -> list[tuple[int, str]]:
-        now = utc_now().isoformat()
+    def resize_shell_session(self, session_id: str, rows: int, cols: int) -> int:
         with self._lock, self._conn:
-            rows = self._conn.execute(
-                """
-                SELECT seq, data FROM shell_inputs
-                WHERE session_id = ? AND seq > ? AND consumed_at IS NULL
-                ORDER BY seq ASC
-                """,
-                (session_id, after_seq),
-            ).fetchall()
-            if rows:
-                self._conn.executemany(
-                    "UPDATE shell_inputs SET consumed_at = ? WHERE session_id = ? AND seq = ?",
-                    [(now, session_id, int(row["seq"])) for row in rows],
-                )
-        return [(int(row["seq"]), str(row["data"])) for row in rows]
-
-    def append_shell_event(self, session_id: str, stream: str, data: str) -> ShellEvent:
-        now = utc_now()
-        with self._lock, self._conn:
-            seq_row = self._conn.execute(
-                "SELECT COALESCE(MAX(seq), 0) AS max_seq FROM shell_events WHERE session_id = ?",
-                (session_id,),
-            ).fetchone()
-            seq = int(seq_row["max_seq"]) + 1
-            self._conn.execute(
-                """
-                INSERT INTO shell_events (session_id, seq, stream, data, created_at)
-                VALUES (?, ?, ?, ?, ?)
-                """,
-                (session_id, seq, stream, data, now.isoformat()),
+            row = self._conn.execute("SELECT * FROM shell_sessions WHERE session_id = ?", (session_id,)).fetchone()
+            if row is None:
+                raise KeyError(session_id)
+            record = self._row_to_shell(dict(row))
+            event = self._append_agent_control_event_locked(
+                record.agent_id,
+                "shell.resize",
+                {"session_id": session_id, "rows": rows, "cols": cols},
             )
-        return ShellEvent(seq=seq, stream=stream, data=data, created_at=now)
-
-    def get_shell_events(self, session_id: str, after_seq: int) -> list[ShellEvent]:
-        with self._lock:
-            rows = self._conn.execute(
-                """
-                SELECT seq, stream, data, created_at FROM shell_events
-                WHERE session_id = ? AND seq > ?
-                ORDER BY seq ASC
-                """,
-                (session_id, after_seq),
-            ).fetchall()
-        return [
-            ShellEvent(
-                seq=int(row["seq"]),
-                stream=str(row["stream"]),
-                data=str(row["data"]),
-                created_at=_parse_dt(row["created_at"]),
-            )
-            for row in rows
-        ]
+        self._notify_update()
+        return event.event_id
 
     def close_shell_session(self, session_id: str) -> ShellSessionRecord:
         now = utc_now().isoformat()
         with self._lock, self._conn:
-            updated = self._conn.execute(
-                "UPDATE shell_sessions SET close_requested_at = ? WHERE session_id = ?",
-                (now, session_id),
-            )
-            if updated.rowcount == 0:
-                raise KeyError(session_id)
             row = self._conn.execute("SELECT * FROM shell_sessions WHERE session_id = ?", (session_id,)).fetchone()
-            assert row is not None
-        return self._row_to_shell(dict(row))
-
-    def complete_shell_session(self, session_id: str, request: ShellCompletionRequest) -> ShellSessionRecord:
-        finished = utc_now().isoformat()
-        with self._lock, self._conn:
-            updated = self._conn.execute(
-                """
-                UPDATE shell_sessions
-                SET status = ?, finished_at = ?, exit_code = ?, failure_code = ?
-                WHERE session_id = ?
-                """,
-                (request.status.value, finished, request.exit_code, request.failure_code, session_id),
-            )
-            if updated.rowcount == 0:
+            if row is None:
                 raise KeyError(session_id)
-            row = self._conn.execute("SELECT * FROM shell_sessions WHERE session_id = ?", (session_id,)).fetchone()
-            assert row is not None
-        return self._row_to_shell(dict(row))
+            record = self._row_to_shell(dict(row))
+            if record.status in {ShellSessionStatus.CLOSED, ShellSessionStatus.FAILED}:
+                return record
+            if record.status == ShellSessionStatus.QUEUED:
+                self._conn.execute(
+                    """
+                    UPDATE shell_sessions
+                    SET status = ?, close_requested_at = ?, finished_at = ?, exit_code = ?, failure_code = ?
+                    WHERE session_id = ?
+                    """,
+                    (ShellSessionStatus.CLOSED.value, now, now, 0, None, session_id),
+                )
+                self._append_shell_event_locked(
+                    session_id,
+                    "shell.closed",
+                    {"session_id": session_id, "status": ShellSessionStatus.CLOSED.value, "exit_code": 0},
+                )
+            else:
+                self._conn.execute("UPDATE shell_sessions SET close_requested_at = ? WHERE session_id = ?", (now, session_id))
+                self._append_agent_control_event_locked(record.agent_id, "shell.close", {"session_id": session_id})
+            updated = self._conn.execute("SELECT * FROM shell_sessions WHERE session_id = ?", (session_id,)).fetchone()
+            assert updated is not None
+        self._notify_update()
+        return self._row_to_shell(dict(updated))
 
     def get_shell_session(self, session_id: str) -> ShellSessionRecord | None:
         with self._lock:
@@ -676,11 +605,192 @@ class HubStore:
             rows = self._conn.execute(query, params).fetchall()
         return [self._row_to_shell(dict(row)) for row in rows]
 
+    def get_agent_control_events(self, agent_id: str, after_seq: int) -> list[AgentControlEvent]:
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT seq, kind, payload_json, created_at
+                FROM agent_control_events
+                WHERE agent_id = ? AND seq > ?
+                ORDER BY seq ASC
+                """,
+                (agent_id, after_seq),
+            ).fetchall()
+        return [
+            AgentControlEvent(
+                event_id=int(row["seq"]),
+                agent_id=agent_id,
+                kind=str(row["kind"]),
+                payload=json.loads(str(row["payload_json"])),
+                created_at=_parse_dt(row["created_at"]),
+            )
+            for row in rows
+        ]
+
+    def get_command_events(self, command_id: str, after_seq: int) -> list[EventRecord]:
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT seq, kind, payload_json, created_at
+                FROM command_events
+                WHERE command_id = ? AND seq > ?
+                ORDER BY seq ASC
+                """,
+                (command_id, after_seq),
+            ).fetchall()
+        return [self._row_to_event(dict(row)) for row in rows]
+
+    def get_shell_events(self, session_id: str, after_seq: int) -> list[EventRecord]:
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT seq, kind, payload_json, created_at
+                FROM shell_stream_events
+                WHERE session_id = ? AND seq > ?
+                ORDER BY seq ASC
+                """,
+                (session_id, after_seq),
+            ).fetchall()
+        return [self._row_to_event(dict(row)) for row in rows]
+
+    def append_command_event(self, command_id: str, kind: str, payload: dict) -> EventRecord:
+        with self._lock, self._conn:
+            event = self._append_command_event_locked(command_id, kind, payload)
+        self._notify_update()
+        return event
+
+    def append_shell_event(self, session_id: str, kind: str, payload: dict) -> EventRecord:
+        with self._lock, self._conn:
+            event = self._append_shell_event_locked(session_id, kind, payload)
+        self._notify_update()
+        return event
+
+    def apply_agent_events(self, agent_id: str, events: list[AgentEvent]) -> None:
+        if not events:
+            return
+        with self._lock, self._conn:
+            for item in events:
+                kind = item.kind
+                payload = dict(item.payload)
+                if kind == "agent.heartbeat":
+                    now = utc_now().isoformat()
+                    self._conn.execute("UPDATE agents SET last_seen_at = ? WHERE agent_id = ?", (now, agent_id))
+                    continue
+                if kind == "command.started":
+                    self._append_command_event_locked(payload["command_id"], kind, payload)
+                    continue
+                if kind in {"command.stdout", "command.stderr"}:
+                    command_id = str(payload["command_id"])
+                    data = str(payload.get("data", ""))
+                    path = self.command_output_path(command_id, "stdout" if kind.endswith("stdout") else "stderr")
+                    with path.open("a", encoding="utf-8") as handle:
+                        handle.write(data)
+                    self._append_command_event_locked(command_id, kind, payload)
+                    continue
+                if kind == "command.exit":
+                    command_id = str(payload["command_id"])
+                    finished = utc_now().isoformat()
+                    self._conn.execute(
+                        """
+                        UPDATE commands
+                        SET status = ?, finished_at = ?, exit_code = ?, failure_code = ?
+                        WHERE command_id = ?
+                        """,
+                        (
+                            payload["status"],
+                            finished,
+                            payload.get("exit_code"),
+                            payload.get("failure_code"),
+                            command_id,
+                        ),
+                    )
+                    self._append_command_event_locked(command_id, kind, payload)
+                    continue
+                if kind == "shell.started":
+                    self._append_shell_event_locked(payload["session_id"], kind, payload)
+                    continue
+                if kind in {"shell.stdout", "shell.stderr", "shell.system"}:
+                    self._append_shell_event_locked(payload["session_id"], kind, payload)
+                    continue
+                if kind in {"shell.exit", "shell.closed"}:
+                    session_id = str(payload["session_id"])
+                    finished = utc_now().isoformat()
+                    self._conn.execute(
+                        """
+                        UPDATE shell_sessions
+                        SET status = ?, finished_at = ?, exit_code = ?, failure_code = ?
+                        WHERE session_id = ?
+                        """,
+                        (
+                            payload["status"],
+                            finished,
+                            payload.get("exit_code"),
+                            payload.get("failure_code"),
+                            session_id,
+                        ),
+                    )
+                    self._append_shell_event_locked(session_id, kind, payload)
+                    continue
+                raise ValueError(f"unsupported agent event kind: {kind}")
+        self._notify_update()
+
     def package_path(self, package_id: str) -> Path:
         return self.packages_root / f"{package_id}.tar.gz"
 
     def command_output_path(self, command_id: str, stream: str) -> Path:
         return self.commands_root / f"{command_id}.{stream}"
+
+    def _notify_update(self) -> None:
+        with self._updates:
+            self._updates.notify_all()
+
+    def _append_agent_control_event_locked(self, agent_id: str, kind: str, payload: dict) -> AgentControlEvent:
+        now = utc_now()
+        seq_row = self._conn.execute(
+            "SELECT COALESCE(MAX(seq), 0) AS max_seq FROM agent_control_events WHERE agent_id = ?",
+            (agent_id,),
+        ).fetchone()
+        seq = int(seq_row["max_seq"]) + 1
+        self._conn.execute(
+            """
+            INSERT INTO agent_control_events (agent_id, seq, kind, payload_json, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (agent_id, seq, kind, json.dumps(payload), now.isoformat()),
+        )
+        return AgentControlEvent(event_id=seq, agent_id=agent_id, kind=kind, payload=payload, created_at=now)
+
+    def _append_command_event_locked(self, command_id: str, kind: str, payload: dict) -> EventRecord:
+        now = utc_now()
+        seq_row = self._conn.execute(
+            "SELECT COALESCE(MAX(seq), 0) AS max_seq FROM command_events WHERE command_id = ?",
+            (command_id,),
+        ).fetchone()
+        seq = int(seq_row["max_seq"]) + 1
+        self._conn.execute(
+            """
+            INSERT INTO command_events (command_id, seq, kind, payload_json, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (command_id, seq, kind, json.dumps(payload), now.isoformat()),
+        )
+        return EventRecord(event_id=seq, kind=kind, payload=payload, created_at=now)
+
+    def _append_shell_event_locked(self, session_id: str, kind: str, payload: dict) -> EventRecord:
+        now = utc_now()
+        seq_row = self._conn.execute(
+            "SELECT COALESCE(MAX(seq), 0) AS max_seq FROM shell_stream_events WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()
+        seq = int(seq_row["max_seq"]) + 1
+        self._conn.execute(
+            """
+            INSERT INTO shell_stream_events (session_id, seq, kind, payload_json, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (session_id, seq, kind, json.dumps(payload), now.isoformat()),
+        )
+        return EventRecord(event_id=seq, kind=kind, payload=payload, created_at=now)
 
     @staticmethod
     def _read_from_offset(path: Path, offset: int) -> str:
@@ -733,6 +843,15 @@ class HubStore:
             record.close_requested_at.isoformat() if record.close_requested_at else None,
             record.exit_code,
             record.failure_code,
+        )
+
+    @staticmethod
+    def _row_to_event(row: dict) -> EventRecord:
+        return EventRecord(
+            event_id=int(row["seq"]),
+            kind=str(row["kind"]),
+            payload=json.loads(str(row["payload_json"])),
+            created_at=_parse_dt(row["created_at"]),
         )
 
     @staticmethod

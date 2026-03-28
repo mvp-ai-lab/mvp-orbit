@@ -10,7 +10,7 @@
 
 ## Why Orbit
 
-`mvp-orbit` is a small HTTP-based remote execution loop for one specific workflow:
+`mvp-orbit` is a small HTTP-only remote execution loop for one specific workflow:
 
 1. prepare code on one machine
 2. send it to another machine
@@ -30,9 +30,9 @@ Typical use cases:
 Orbit has three decoupled roles:
 
 - `Hub`
-  The control plane. It stores packages, commands, shell sessions, tokens, and ownership metadata.
+  The control plane. It stores packages, commands, shell sessions, tokens, ownership metadata, and realtime event logs.
 - `Agent`
-  The execution side. An Agent polls the Hub for work and runs commands on its own machine.
+  The execution side. An Agent keeps one long-lived SSE control stream to the Hub, executes work locally, and posts events back over HTTP.
 - `User`
   The control side. A user sends commands to the Hub and targets a specific Agent.
 
@@ -42,18 +42,15 @@ flowchart LR
     H["Hub<br/>control plane"]
     A["Agent<br/>execution side"]
 
-    U -->|"orbit connect<br/>bootstrap_token -> user_token"| H
-    U -->|"package upload<br/>command exec<br/>shell start"| H
-    A -->|"poll commands and shells<br/>with user_token"| H
-    H -->|lease command or shell session| A
-    A -->|"stdout stderr heartbeat<br/>completion events"| H
-    H -->|"command output<br/>shell events"| U
+    U -->|"orbit connect<br/>package upload<br/>cmd exec<br/>shell start"| H
+    U <-->|"SSE command stream<br/>SSE shell stream"| H
+    A <-->|"SSE control stream<br/>HTTP event POSTs"| H
 ```
 
 This means the Hub can run on a dedicated server. The only required network condition is:
 
-- the User machine can reach the Hub over HTTP
-- the Agent machine can reach the Hub over HTTP
+- the User machine can reach the Hub over HTTP or HTTPS
+- the Agent machine can reach the Hub over HTTP or HTTPS
 
 The User and Agent do not need direct connectivity to each other.
 
@@ -61,7 +58,7 @@ The User and Agent do not need direct connectivity to each other.
 
 Every Agent belongs to exactly one `user_id`.
 
-- The first successful Agent poll registers that `agent_id` under the current user.
+- The first successful Agent control-stream connection registers that `agent_id` under the current user.
 - Only the same user can submit commands to that Agent, open shells on it, or read its outputs.
 - Agents owned by different users are isolated and cannot be mixed.
 - Package access is also isolated per user, even when two users upload identical bytes and receive the same `package_id`.
@@ -85,7 +82,8 @@ Important notes:
 
 - The control machine and the Agent machine do not need to share the exact same token string.
 - They do need tokens that belong to the same `user_id` if that user should control that Agent.
-- `orbit init node` uses or updates `user_token` and `expires_at` in local config. In practice those values often come from a previous `orbit connect`.
+- `orbit connect` prints an `ORBIT_AGENT_CONFIG_STRING` that can be copied to another machine.
+- `orbit init node` or `orbit init agent` can consume that config-string, but `agent_id` is still chosen locally on the Agent machine.
 
 ## Runtime Model
 
@@ -93,18 +91,21 @@ Orbit is built around three user-facing actions:
 
 - `package`
   Build a deterministic `.tar.gz` from a directory and upload it to the Hub.
-- `command exec`
+- `cmd exec`
   Send a command to a specific Agent. `package_id` is optional.
 - `shell`
-  Open a persistent remote shell session, with reconnect support.
+  Open a persistent remote shell session with PTY semantics and reconnect support.
 
 Key runtime semantics:
 
-- The Agent startup directory is the base workspace.
+- Hub, CLI, and Agent communicate using HTTP only.
+- Realtime delivery uses `SSE` down and `POST` up.
+- The Agent startup directory is the base workspace unless `workspace_root` is configured.
 - Commands without `package_id` run directly in the base workspace.
 - Commands with `package_id` run in a package-specific subdirectory under the base workspace.
 - Shell sessions start in the base workspace by default, or in the package workspace when `package_id` is provided.
-- Hub, CLI, and Agent communicate using HTTP + Bearer token only.
+- `cmd exec` waits and streams output by default. Use `--detach` to return immediately.
+- `cmd exec` and `cmd output --follow` now return a local exit code derived from the remote terminal state and print a one-line summary on `stderr`.
 
 ## Quick Start
 
@@ -121,10 +122,10 @@ orbit hub serve
 
 ### 2. Connect as a user
 
-On the user (development) machine:
+On the user machine:
 
 ```bash
-orbit connect --hub-url http://127.0.0.1:8080
+orbit connect
 ```
 
 `orbit connect` asks for:
@@ -133,28 +134,30 @@ orbit connect --hub-url http://127.0.0.1:8080
 - a `user_id`
 - the Hub `bootstrap_token`
 
-It then writes `user_token` and `expires_at` into local config.
+It then writes `user_token` and `expires_at` into local config and prints:
 
-If the same user should control an Agent, the Agent machine should also have a valid token for the same `user_id`.
+```text
+ORBIT_AGENT_CONFIG_STRING=orbit-agent-config-string-v1:...
+```
 
 ### 3. Initialize and run the Agent
 
-On the agent (execution) machine:
+On the agent machine:
 
 ```bash
-orbit init node --agent-id agent-a
+orbit init agent --config-string 'orbit-agent-config-string-v1:...' --agent-id agent-a
 orbit agent run
 ```
 
-`orbit init node` configures:
+Or use the interactive flow:
 
-- the Hub URL
-- `user_token`
-- `expires_at`
-- `agent_id`
-- workspace and polling settings
+```bash
+orbit init agent
+```
 
-When the Agent starts polling successfully, that `agent_id` becomes owned by the current user.
+Then paste the config-string and enter the local `agent_id`.
+
+When the Agent connects its control stream successfully, that `agent_id` becomes owned by the current user.
 
 ## Common Flows
 
@@ -177,7 +180,7 @@ Example response:
 ### Execute in the Agent base workspace
 
 ```bash
-orbit command exec \
+orbit cmd exec \
   --agent-id agent-a \
   -- pwd
 ```
@@ -185,7 +188,7 @@ orbit command exec \
 ### Execute against an uploaded package
 
 ```bash
-orbit command exec \
+orbit cmd exec \
   --agent-id agent-a \
   --package-id <PACKAGE_ID> \
   -- python3 train.py --epochs 1
@@ -194,7 +197,7 @@ orbit command exec \
 ### Execute a compound shell command
 
 ```bash
-orbit command exec \
+orbit cmd exec \
   --agent-id agent-a \
   --shell \
   "cd /cache/models && HF_TOKEN=hf_xxx hf download repo --local-dir model-dir"
@@ -211,7 +214,7 @@ Use `--shell` when the remote command needs shell features such as:
 ### Submit without waiting
 
 ```bash
-orbit command exec \
+orbit cmd exec \
   --agent-id agent-a \
   --package-id <PACKAGE_ID> \
   --detach \
@@ -221,11 +224,16 @@ orbit command exec \
 Then inspect it later:
 
 ```bash
-orbit command status --command-id <COMMAND_ID>
-orbit command output --command-id <COMMAND_ID>
-orbit command output --command-id <COMMAND_ID> --follow
-orbit command cancel --command-id <COMMAND_ID>
+orbit cmd status --command-id <COMMAND_ID>
+orbit cmd output --command-id <COMMAND_ID>
+orbit cmd output --command-id <COMMAND_ID> --follow
+orbit cmd cancel --command-id <COMMAND_ID>
 ```
+
+Notes:
+
+- `orbit cmd exec` streams output and exits with a mapped local exit code unless `--detach` is used.
+- `orbit cmd output --follow` reattaches to a detached command, prints a terminal summary on `stderr`, and exits with a mapped local exit code.
 
 ### Open a remote shell
 
@@ -250,10 +258,12 @@ orbit shell attach --session-id <SESSION_ID>
 orbit shell close --session-id <SESSION_ID>
 ```
 
-While attached locally:
+Notes:
 
-- `/detach` disconnects the local client but keeps the remote shell alive
-- `/close` closes the remote shell
+- `orbit shell start` attaches immediately when run in a TTY, unless `--detach` is used.
+- `orbit shell start --detach` prints the new `session_id` without attaching.
+- `orbit shell attach` gives you a PTY-backed remote shell.
+- To close a shell explicitly, use `orbit shell close --session-id <SESSION_ID>` from any terminal with the same user token.
 
 ## Configuration
 
@@ -274,13 +284,21 @@ object_root = "./.orbit-hub/objects"
 url = "http://127.0.0.1:8080"
 
 [auth]
-bootstrap_token = "..."  # (optional on hub host) used by orbit connect
+bootstrap_token = "..."  # optional on the hub host; used by orbit connect
 user_token = "..."       # used by CLI and Agent runtime
 expires_at = "2026-03-18T12:34:56+00:00"
 
 [agent]
 id = "agent-a"
 workspace_root = "./workspace"
-poll_interval_sec = 5.0
-heartbeat_interval_sec = 5.0
 ```
+
+## Legacy Notes
+
+The following older concepts are no longer part of the product:
+
+- agent-side polling loops
+- `commands/next` and `shells/next`
+- shared bundle strings such as `ORBIT_AGENT_INIT`
+- `--shared-config`
+- legacy run/task object workflows

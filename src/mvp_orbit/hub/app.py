@@ -1,26 +1,28 @@
 from __future__ import annotations
 
+import asyncio
+import json
 import os
 import secrets
 
 import uvicorn
-from fastapi import Body, Depends, FastAPI, Header, HTTPException, Query, Response, status
-from fastapi.responses import HTMLResponse
+from fastapi import Body, Depends, FastAPI, Header, HTTPException, Query, Request, Response, status
+from fastapi.responses import HTMLResponse, StreamingResponse
 
 from mvp_orbit.core.canonical import object_id_for_bytes
 from mvp_orbit.core.models import (
-    CommandCompletionRequest,
+    CommandStatus,
     CommandCreateRequest,
-    CommandOutputAppendRequest,
     CommandOutputChunk,
+    CommandLease,
     CommandRecord,
     ConnectRequest,
     ConnectResponse,
+    AgentEventsRequest,
     PackageRecord,
-    ShellCompletionRequest,
-    ShellEventAppendRequest,
-    ShellEventsResponse,
     ShellInputRequest,
+    ShellResizeRequest,
+    ShellSessionLease,
     ShellSessionCreateRequest,
     ShellSessionRecord,
     ShellSessionStatus,
@@ -471,6 +473,10 @@ def _require_shell_owner(store: HubStore, user: AuthenticatedUser, session_id: s
     return record
 
 
+def _format_sse(event_id: int, kind: str, payload: dict) -> bytes:
+    return f"id: {event_id}\nevent: {kind}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n".encode("utf-8")
+
+
 def create_app(*, store: HubStore | None = None, bootstrap_token: str | None = None) -> FastAPI:
     bootstrap_token = bootstrap_token if bootstrap_token is not None else os.getenv("ORBIT_BOOTSTRAP_TOKEN")
     store = store or HubStore(
@@ -481,6 +487,70 @@ def create_app(*, store: HubStore | None = None, bootstrap_token: str | None = N
     require_user = _user_dependency(store)
 
     app = FastAPI(title="mvp-orbit-hub", version="0.4.0")
+
+    async def _agent_stream(request: Request, agent_id: str):
+        try:
+            last_event_id = int(request.headers.get("Last-Event-ID", "0") or "0")
+        except ValueError:
+            last_event_id = 0
+        while True:
+            events = store.get_agent_control_events(agent_id, last_event_id)
+            if events:
+                for event in events:
+                    yield _format_sse(event.event_id, event.kind, event.payload)
+                    last_event_id = event.event_id
+                continue
+            if await request.is_disconnected():
+                break
+            updated = await asyncio.to_thread(store.wait_for_updates, 5.0)
+            if not updated:
+                yield b": keepalive\n\n"
+
+    async def _command_stream(request: Request, command_id: str):
+        try:
+            last_event_id = int(request.headers.get("Last-Event-ID", "0") or "0")
+        except ValueError:
+            last_event_id = 0
+        while True:
+            events = store.get_command_events(command_id, last_event_id)
+            if events:
+                for event in events:
+                    yield _format_sse(event.event_id, event.kind, event.payload)
+                    last_event_id = event.event_id
+                continue
+            record = store.get_command(command_id)
+            if record is None:
+                break
+            if record.status in {CommandStatus.SUCCEEDED, CommandStatus.FAILED, CommandStatus.CANCELED}:
+                break
+            if await request.is_disconnected():
+                break
+            updated = await asyncio.to_thread(store.wait_for_updates, 5.0)
+            if not updated:
+                yield b": keepalive\n\n"
+
+    async def _shell_stream(request: Request, session_id: str):
+        try:
+            last_event_id = int(request.headers.get("Last-Event-ID", "0") or "0")
+        except ValueError:
+            last_event_id = 0
+        while True:
+            events = store.get_shell_events(session_id, last_event_id)
+            if events:
+                for event in events:
+                    yield _format_sse(event.event_id, event.kind, event.payload)
+                    last_event_id = event.event_id
+                continue
+            record = store.get_shell_session(session_id)
+            if record is None:
+                break
+            if record.status in {ShellSessionStatus.CLOSED, ShellSessionStatus.FAILED}:
+                break
+            if await request.is_disconnected():
+                break
+            updated = await asyncio.to_thread(store.wait_for_updates, 5.0)
+            if not updated:
+                yield b": keepalive\n\n"
 
     @app.get("/", response_class=HTMLResponse)
     def landing_page() -> HTMLResponse:
@@ -526,6 +596,16 @@ def create_app(*, store: HubStore | None = None, bootstrap_token: str | None = N
     def get_command(command_id: str, user: AuthenticatedUser = Depends(require_user)) -> CommandRecord:
         return _require_command_owner(store, user, command_id)
 
+    @app.post("/api/commands/{command_id}/claim", response_model=CommandLease)
+    def claim_command(command_id: str, user: AuthenticatedUser = Depends(require_user)) -> CommandLease:
+        record = _require_command_owner(store, user, command_id)
+        try:
+            return store.claim_command(record.command_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+        except KeyError as exc:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="command not found") from exc
+
     @app.get("/api/commands/{command_id}/output", response_model=CommandOutputChunk)
     def get_command_output(
         command_id: str,
@@ -535,26 +615,18 @@ def create_app(*, store: HubStore | None = None, bootstrap_token: str | None = N
     ) -> CommandOutputChunk:
         _require_command_owner(store, user, command_id)
         try:
-            return store.read_command_output(
-                command_id,
-                stdout_offset=stdout_offset,
-                stderr_offset=stderr_offset,
-            )
+            return store.read_command_output(command_id, stdout_offset=stdout_offset, stderr_offset=stderr_offset)
         except KeyError as exc:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="command not found") from exc
 
-    @app.post("/api/commands/{command_id}/output")
-    def append_command_output(
-        command_id: str,
-        request: CommandOutputAppendRequest,
-        user: AuthenticatedUser = Depends(require_user),
-    ) -> dict[str, str]:
+    @app.get("/api/commands/{command_id}/stream")
+    async def stream_command_output(command_id: str, request: Request, user: AuthenticatedUser = Depends(require_user)) -> StreamingResponse:
         _require_command_owner(store, user, command_id)
-        try:
-            store.append_command_output(command_id, request.stream, request.data)
-        except KeyError as exc:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="command not found") from exc
-        return {"status": "accepted"}
+        return StreamingResponse(
+            _command_stream(request, command_id),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
+        )
 
     @app.post("/api/commands/{command_id}/cancel", response_model=CommandRecord)
     def cancel_command(command_id: str, user: AuthenticatedUser = Depends(require_user)) -> CommandRecord:
@@ -564,36 +636,30 @@ def create_app(*, store: HubStore | None = None, bootstrap_token: str | None = N
         except KeyError as exc:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="command not found") from exc
 
-    @app.get("/api/agents/{agent_id}/commands/next", response_model=None)
-    def poll_next_command(agent_id: str, user: AuthenticatedUser = Depends(require_user)) -> Response | dict:
+    @app.get("/api/agents/{agent_id}/stream")
+    async def agent_stream(agent_id: str, request: Request, user: AuthenticatedUser = Depends(require_user)) -> StreamingResponse:
         try:
             store.register_agent(agent_id, user.user_id)
         except OwnershipError as exc:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="forbidden") from exc
-        lease = store.lease_next_command(agent_id, user.user_id)
-        if lease is None:
-            return Response(status_code=status.HTTP_204_NO_CONTENT)
-        return lease.model_dump(mode="json")
+        return StreamingResponse(
+            _agent_stream(request, agent_id),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
+        )
 
-    @app.post("/api/commands/{command_id}/heartbeat", response_model=CommandRecord)
-    def heartbeat_command(command_id: str, user: AuthenticatedUser = Depends(require_user)) -> CommandRecord:
-        _require_command_owner(store, user, command_id)
-        try:
-            return store.heartbeat_command(command_id)
-        except KeyError as exc:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="command not found") from exc
-
-    @app.post("/api/commands/{command_id}/complete", response_model=CommandRecord)
-    def complete_command(
-        command_id: str,
-        request: CommandCompletionRequest,
+    @app.post("/api/agents/{agent_id}/events")
+    def append_agent_events(
+        agent_id: str,
+        request: AgentEventsRequest,
         user: AuthenticatedUser = Depends(require_user),
-    ) -> CommandRecord:
-        _require_command_owner(store, user, command_id)
+    ) -> dict[str, int]:
         try:
-            return store.complete_command(command_id, request)
-        except KeyError as exc:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="command not found") from exc
+            store.register_agent(agent_id, user.user_id)
+        except OwnershipError as exc:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="forbidden") from exc
+        store.apply_agent_events(agent_id, request.events)
+        return {"accepted": len(request.events)}
 
     @app.post("/api/shells", response_model=ShellSessionRecord)
     def create_shell_session(
@@ -621,6 +687,16 @@ def create_app(*, store: HubStore | None = None, bootstrap_token: str | None = N
     def get_shell_session(session_id: str, user: AuthenticatedUser = Depends(require_user)) -> ShellSessionRecord:
         return _require_shell_owner(store, user, session_id)
 
+    @app.post("/api/shells/{session_id}/claim", response_model=ShellSessionLease)
+    def claim_shell_session(session_id: str, user: AuthenticatedUser = Depends(require_user)) -> ShellSessionLease:
+        record = _require_shell_owner(store, user, session_id)
+        try:
+            return store.claim_shell_session(record.session_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+        except KeyError as exc:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="shell session not found") from exc
+
     @app.post("/api/shells/{session_id}/input")
     def append_shell_input(
         session_id: str,
@@ -628,24 +704,30 @@ def create_app(*, store: HubStore | None = None, bootstrap_token: str | None = N
         user: AuthenticatedUser = Depends(require_user),
     ) -> dict[str, int]:
         _require_shell_owner(store, user, session_id)
-        return {"seq": store.append_shell_input(session_id, request.data)}
+        try:
+            return {"seq": store.append_shell_input(session_id, request.data)}
+        except KeyError as exc:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="shell session not found") from exc
 
-    @app.get("/api/shells/{session_id}/events", response_model=ShellEventsResponse)
-    def get_shell_events(
+    @app.post("/api/shells/{session_id}/resize")
+    def resize_shell_session(
         session_id: str,
-        after_seq: int = Query(default=0, ge=0),
+        request: ShellResizeRequest,
         user: AuthenticatedUser = Depends(require_user),
-    ) -> ShellEventsResponse:
-        record = _require_shell_owner(store, user, session_id)
-        events = store.get_shell_events(session_id, after_seq)
-        next_seq = after_seq + 1 if not events else events[-1].seq + 1
-        return ShellEventsResponse(
-            session_id=session_id,
-            status=record.status,
-            events=events,
-            next_seq=next_seq,
-            exit_code=record.exit_code,
-            failure_code=record.failure_code,
+    ) -> dict[str, int]:
+        _require_shell_owner(store, user, session_id)
+        try:
+            return {"seq": store.resize_shell_session(session_id, request.rows, request.cols)}
+        except KeyError as exc:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="shell session not found") from exc
+
+    @app.get("/api/shells/{session_id}/stream")
+    async def stream_shell_output(session_id: str, request: Request, user: AuthenticatedUser = Depends(require_user)) -> StreamingResponse:
+        _require_shell_owner(store, user, session_id)
+        return StreamingResponse(
+            _shell_stream(request, session_id),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
         )
 
     @app.post("/api/shells/{session_id}/close", response_model=ShellSessionRecord)
@@ -653,57 +735,6 @@ def create_app(*, store: HubStore | None = None, bootstrap_token: str | None = N
         _require_shell_owner(store, user, session_id)
         try:
             return store.close_shell_session(session_id)
-        except KeyError as exc:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="shell session not found") from exc
-
-    @app.get("/api/agents/{agent_id}/shells/next", response_model=None)
-    def poll_next_shell(agent_id: str, user: AuthenticatedUser = Depends(require_user)) -> Response | dict:
-        try:
-            store.register_agent(agent_id, user.user_id)
-        except OwnershipError as exc:
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="forbidden") from exc
-        lease = store.lease_next_shell_session(agent_id, user.user_id)
-        if lease is None:
-            return Response(status_code=status.HTTP_204_NO_CONTENT)
-        return lease.model_dump(mode="json")
-
-    @app.get("/api/shells/{session_id}/inputs")
-    def consume_shell_inputs(
-        session_id: str,
-        after_seq: int = Query(default=0, ge=0),
-        user: AuthenticatedUser = Depends(require_user),
-    ) -> dict:
-        _require_shell_owner(store, user, session_id)
-        items = store.consume_shell_inputs(session_id, after_seq)
-        return {"inputs": [{"seq": seq, "data": data} for seq, data in items]}
-
-    @app.post("/api/shells/{session_id}/events")
-    def append_shell_event(
-        session_id: str,
-        request: ShellEventAppendRequest,
-        user: AuthenticatedUser = Depends(require_user),
-    ) -> dict:
-        _require_shell_owner(store, user, session_id)
-        event = store.append_shell_event(session_id, request.stream, request.data)
-        return event.model_dump(mode="json")
-
-    @app.post("/api/shells/{session_id}/heartbeat", response_model=ShellSessionRecord)
-    def heartbeat_shell_session(session_id: str, user: AuthenticatedUser = Depends(require_user)) -> ShellSessionRecord:
-        _require_shell_owner(store, user, session_id)
-        try:
-            return store.heartbeat_shell_session(session_id)
-        except KeyError as exc:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="shell session not found") from exc
-
-    @app.post("/api/shells/{session_id}/complete", response_model=ShellSessionRecord)
-    def complete_shell_session(
-        session_id: str,
-        request: ShellCompletionRequest,
-        user: AuthenticatedUser = Depends(require_user),
-    ) -> ShellSessionRecord:
-        _require_shell_owner(store, user, session_id)
-        try:
-            return store.complete_shell_session(session_id, request)
         except KeyError as exc:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="shell session not found") from exc
 

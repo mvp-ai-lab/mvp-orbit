@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from typing import Any
 from datetime import datetime, timezone
 from enum import Enum
 from uuid import uuid4
@@ -141,6 +142,34 @@ class CommandOutputChunk(BaseModel):
     failure_code: str | None = None
 
 
+class EventRecord(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    event_id: int = Field(ge=1)
+    kind: str = Field(min_length=1)
+    payload: dict[str, Any] = Field(default_factory=dict)
+    created_at: datetime
+
+
+class AgentControlEvent(EventRecord):
+    model_config = ConfigDict(extra="forbid")
+
+    agent_id: str = Field(min_length=1)
+
+
+class AgentEvent(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    kind: str = Field(min_length=1)
+    payload: dict[str, Any] = Field(default_factory=dict)
+
+
+class AgentEventsRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    events: list[AgentEvent] = Field(default_factory=list)
+
+
 class ShellSessionCreateRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -179,6 +208,13 @@ class ShellInputRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     data: str = Field(min_length=1)
+
+
+class ShellResizeRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    rows: int = Field(ge=1)
+    cols: int = Field(ge=1)
 
 
 class ShellEvent(BaseModel):

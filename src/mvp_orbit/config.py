@@ -38,8 +38,6 @@ class AgentConfig(BaseModel):
 
     id: str | None = None
     workspace_root: str | None = None
-    poll_interval_sec: float = 5.0
-    heartbeat_interval_sec: float = 5.0
 
 
 class OrbitConfig(BaseModel):
