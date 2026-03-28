@@ -397,7 +397,7 @@ LANDING_PAGE_HTML = """<!DOCTYPE html>
               <strong>GitHub Repository</strong>
               <span>Source, issues, and commit history for the Hub, CLI, and Agent runtime.</span>
             </a>
-            <a class="link-card" href="https://github.com/mvp-ai-lab/mvp-orbit/releases/tag/v0.4.0" target="_blank" rel="noreferrer">
+            <a class="link-card" href="https://github.com/mvp-ai-lab/mvp-orbit/releases/tag/v0.5.0" target="_blank" rel="noreferrer">
               <strong>Latest Release</strong>
               <span>Grab the current wheel, inspect release notes, and track shipped versions.</span>
             </a>
@@ -486,7 +486,7 @@ def create_app(*, store: HubStore | None = None, bootstrap_token: str | None = N
     require_bootstrap = _bootstrap_dependency(bootstrap_token)
     require_user = _user_dependency(store)
 
-    app = FastAPI(title="mvp-orbit-hub", version="0.4.0")
+    app = FastAPI(title="mvp-orbit-hub", version="0.5.0")
 
     async def _agent_stream(request: Request, agent_id: str):
         try:
@@ -754,7 +754,7 @@ def _ensure_runtime_token() -> str:
 try:
     app = create_app()
 except RuntimeError:
-    app = FastAPI(title="mvp-orbit-hub", version="0.4.0")
+    app = FastAPI(title="mvp-orbit-hub", version="0.5.0")
 
 
 def main() -> None:
