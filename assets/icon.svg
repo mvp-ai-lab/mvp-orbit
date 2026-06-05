@@ -1,0 +1,12 @@
+<svg width="256" height="256" viewBox="0 0 256 256" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title desc">
+  <title id="title">mvp-orbit icon</title>
+  <desc id="desc">A control host relaying commands between peer clients in orbit.</desc>
+  <rect width="256" height="256" rx="56" fill="#0B1020"/>
+  <circle cx="128" cy="128" r="84" stroke="#2DD4BF" stroke-width="10" stroke-linecap="round" stroke-dasharray="68 28" opacity="0.9"/>
+  <circle cx="128" cy="128" r="38" fill="#111827" stroke="#E5E7EB" stroke-width="8"/>
+  <path d="M112 128h32M128 112v32" stroke="#E5E7EB" stroke-width="10" stroke-linecap="round"/>
+  <circle cx="128" cy="38" r="18" fill="#F59E0B" stroke="#111827" stroke-width="6"/>
+  <circle cx="205" cy="173" r="18" fill="#38BDF8" stroke="#111827" stroke-width="6"/>
+  <circle cx="51" cy="173" r="18" fill="#A78BFA" stroke="#111827" stroke-width="6"/>
+  <path d="M128 59v30M187 162l-27-16M69 162l27-16" stroke="#94A3B8" stroke-width="8" stroke-linecap="round"/>
+</svg>

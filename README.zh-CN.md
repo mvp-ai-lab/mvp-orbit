@@ -1,23 +1,145 @@
 <p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="./assets/logo-dark.png">
-    <source media="(prefers-color-scheme: light)" srcset="./assets/logo-light.png">
-    <img alt="mvp-orbit" src="./assets/logo-dark.png" width="560">
-  </picture>
+  <img alt="mvp-orbit icon" src="./assets/icon.svg" width="96" height="96">
 </p>
 
-<div align="center">by MVP Lab.</div>
+<h1 align="center">MVP Orbit</h1>
+
+<p align="center">by MVP Lab.</p>
+
+<p align="center">
+  <a href="https://github.com/mvp-ai-lab/mvp-orbit/releases"><img alt="GitHub release" src="https://img.shields.io/github/v/release/mvp-ai-lab/mvp-orbit?style=flat-square"></a>
+  <img alt="Python 3.11+" src="https://img.shields.io/badge/python-%3E%3D3.11-3776AB?style=flat-square&logo=python&logoColor=white">
+  <img alt="CLI orbit" src="https://img.shields.io/badge/cli-orbit-111827?style=flat-square">
+  <img alt="Transport HTTP/SSE" src="https://img.shields.io/badge/transport-HTTP%20%2B%20SSE-0F766E?style=flat-square">
+  <img alt="Modes exec shell files" src="https://img.shields.io/badge/modes-exec%20%7C%20shell%20%7C%20files-7C3AED?style=flat-square">
+</p>
+
 ## Orbit 是什么
 
-`mvp-orbit` 是一个纯 HTTP 的 peer 命令 channel。
+`mvp-orbit` 是一个轻量的纯 HTTP peer 命令 channel。
 
-一台机器运行控制 `host`。每台 `client` 加入某个命名 channel 时只需要提供：
+运行一个控制 `host`，让多台 `client` 加入同一个 channel，新成员由任意已加入 client 审批。审批通过后，同一 channel 内的成员可以互相执行命令、打开 shell、传输文件。client 只需要能访问 host，不需要彼此直连。
 
-- 本机别名
-- host 地址
-- channel 名称
+## 核心功能
 
-第一个加入 channel 的 client 会自动通过。后续 client 会创建 pending join request，任意已经加入该 channel 的 client 都可以批准或拒绝。审批通过后，同一 channel 的成员可以通过 host 发送命令、打开 shell、传输文件。client 之间不需要彼此直连。
+- 简单加入：只需要 `host 地址`、本机 `alias` 和 `channel` 名称。
+- 某个 channel 的第一台 client 自动通过。
+- 后续 client 必须由已有 channel 成员审批。
+- 前台运行的 `orbit join` 可以在新 client 申请加入时直接弹出审批 prompt。
+- 单命令模式：`orbit exec <peer> -- <command>` 发送命令并等待输出和退出码。
+- 交互式 shell 模式：`orbit sh <peer>` 打开目标 client 上的实时 shell。
+- 文件传输模式：`orbit put` 和 `orbit get`，默认大小限制 `1 MiB`。
+- 通过 host 使用 HTTP/SSE 转发，不需要 client 之间直接联网。
+- host 自动清理空 channel。
+
+## 快速开始
+
+### 1. 安装或直接运行
+
+从源码目录运行：
+
+```bash
+uv run orbit --help
+```
+
+把当前 GitHub Release 的 wheel 安装成工具：
+
+```bash
+uv tool install https://github.com/mvp-ai-lab/mvp-orbit/releases/download/v0.6.0/mvp_orbit-0.6.0-py3-none-any.whl
+```
+
+### 2. 启动 Host
+
+```bash
+orbit host
+```
+
+默认监听 `127.0.0.1:8080`。如果需要允许其他机器连接：
+
+```bash
+ORBIT_HUB_HOST=0.0.0.0 orbit host
+```
+
+### 3. 第一台 Client 加入
+
+```bash
+orbit join --host http://HOST:8080 --alias client-a --channel team-a
+```
+
+`orbit join` 会在前台持续运行。加入成功后，这个进程负责接收命令、shell、文件请求和加入审批。
+
+### 4. 第二台 Client 加入
+
+另一台机器执行：
+
+```bash
+orbit join --host http://HOST:8080 --alias client-b --channel team-a
+```
+
+第一台 client 会看到审批 prompt：
+
+```text
+[orbit] new client join request
+  alias: client-b
+  channel: channel-...
+  request: join-...
+[orbit] approve this client? [y/N]:
+```
+
+如果没有交互式 client 在线，可以从任意已有成员手动审批：
+
+```bash
+orbit join-requests
+orbit approve <REQUEST_ID>
+```
+
+拒绝请求：
+
+```bash
+orbit reject <REQUEST_ID>
+```
+
+### 5. 开始使用 Channel
+
+查看 peers：
+
+```bash
+orbit peers
+```
+
+执行单条命令并等待结果：
+
+```bash
+orbit exec client-b -- uname -a
+orbit exec client-b --shell "cd /tmp && pwd && ls -la"
+```
+
+打开交互式 shell：
+
+```bash
+orbit sh client-b
+```
+
+发送文件到对端：
+
+```bash
+orbit put client-b ./local.txt inbox/local.txt
+```
+
+从对端下载文件：
+
+```bash
+orbit get client-b inbox/local.txt ./downloaded.txt
+```
+
+默认文件大小限制是 `1 MiB`。只有需要时才显式提高：
+
+```bash
+orbit put --max-bytes 10485760 client-b ./model.bin models/model.bin
+orbit get --max-bytes 10485760 client-b models/model.bin ./model.bin
+```
+
+## 工作方式
 
 ```mermaid
 flowchart LR
@@ -31,20 +153,11 @@ flowchart LR
     C <-->|"加入审批\n命令 / shell / 文件"| H
 ```
 
-## 安全模型
+host 使用 SQLite 保存 channel 状态并负责事件转发。每个 client 通过前台 SSE 连接接收事件，并通过 HTTP POST 把命令、shell、文件结果返回给 host。
 
-Channel 成员关系就是信任边界。
+## CLI 参考
 
-- 第一个 client 创建 channel，并获得 member token。
-- 后续 client 必须被已有成员审批后才能加入。
-- member token 在过期前可访问该 channel。
-- 任意已批准成员都可以对任意在线成员执行命令。
-
-这不是沙箱。只应该批准可信 client，也只应该在可信 channel 里执行命令。
-
-## 命令
-
-公开 CLI 命令刻意保持很小：
+公开命令面刻意保持很小：
 
 ```bash
 orbit host
@@ -59,107 +172,25 @@ orbit put <peer> <local> <remote>
 orbit get <peer> <remote> <local>
 ```
 
-`exec`、`sh`、`put/get` 是仅有的三类 peer 操作模式。
-
-## 快速开始
-
-### 1. 启动 Host
+常用 `join` 选项：
 
 ```bash
-orbit host
+orbit join --no-start   # 只保存配置，不启动 client loop
+orbit join --no-wait    # 提交加入申请后立即退出
 ```
 
-host 使用 SQLite 保存 channel 状态，并通过 HTTP/SSE 转发事件。默认监听 `127.0.0.1:8080`；如果需要对网络开放，设置 `ORBIT_HUB_HOST=0.0.0.0`。
+命令会在目标 client 的 workspace 内执行。`--working-dir` 必须保持在该 workspace 内。相对 remote path 会解析到目标 client 的 workspace 下；绝对 remote path 也允许，但应谨慎使用。
 
-### 2. 第一台 Client 加入
+## 安全模型
 
-```bash
-orbit join --host http://HOST:8080 --alias client-a --channel team-a
-```
+Channel 成员关系就是信任边界。
 
-`orbit join` 是前台常驻进程。加入成功后，它会启动 client loop，持续接收命令、shell、文件请求和加入审批。如果进程退出，这台 client 就不能再接收任务。
+- 第一个 client 创建 channel，并获得 member token。
+- 后续 client 必须被已有成员审批后才能加入。
+- member token 在过期前可访问该 channel。
+- 任意已批准成员都可以对任意在线成员执行命令。
 
-只想保存配置、不启动 client loop 时使用 `--no-start`：
-
-```bash
-orbit join --host http://HOST:8080 --alias client-a --channel team-a --no-start
-```
-
-### 3. 更多 Client 加入
-
-另一台机器执行：
-
-```bash
-orbit join --host http://HOST:8080 --alias client-b --channel team-a
-```
-
-新 client 会等待审批。同一 channel 内任意正在前台运行的 `orbit join` 进程会直接弹出确认：
-
-```text
-[orbit] new client join request
-  alias: client-b
-  channel: channel-...
-  request: join-...
-[orbit] approve this client? [y/N]:
-```
-
-如果没有交互式终端里的 client 进程，可以从任意已有成员手动审批：
-
-```bash
-orbit join-requests
-orbit approve <REQUEST_ID>
-```
-
-拒绝请求使用 `orbit reject <REQUEST_ID>`。如果新 client 只想提交申请后立即退出，可以加 `--no-wait`。
-
-### 4. 查看 Peers
-
-```bash
-orbit peers
-```
-
-### 5. 执行单条命令
-
-```bash
-orbit exec client-b -- uname -a
-```
-
-需要 shell 操作符、变量、管道或 `cd` 时使用 `--shell`：
-
-```bash
-orbit exec client-b --shell "cd /tmp && pwd && ls -la"
-```
-
-命令在目标 client 的 workspace 内执行。`--working-dir` 必须保持在该 workspace 内。
-
-### 6. 打开交互式 Shell
-
-```bash
-orbit sh client-b
-```
-
-### 7. 传输文件
-
-发送本地文件到对端：
-
-```bash
-orbit put client-b ./local.txt inbox/local.txt
-```
-
-从对端下载文件：
-
-```bash
-orbit get client-b inbox/local.txt ./downloaded.txt
-```
-
-默认大小限制是 `1 MiB`。需要更大文件时显式提高：
-
-```bash
-orbit put --max-bytes 10485760 client-b ./model.bin models/model.bin
-orbit get --max-bytes 10485760 client-b models/model.bin ./model.bin
-```
-
-相对 remote path 会解析到目标 client 的 workspace 下。绝对 remote path 也允许，但应谨慎使用。
+这不是沙箱。只应该批准可信 client，也只应该在可信 channel 里执行命令。
 
 ## 配置
 

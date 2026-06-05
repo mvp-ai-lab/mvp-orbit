@@ -1,23 +1,145 @@
 <p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="./assets/logo-dark.png">
-    <source media="(prefers-color-scheme: light)" srcset="./assets/logo-light.png">
-    <img alt="mvp-orbit" src="./assets/logo-dark.png" width="560">
-  </picture>
+  <img alt="mvp-orbit icon" src="./assets/icon.svg" width="96" height="96">
 </p>
 
-<div align="center">by MVP Lab.</div>
+<h1 align="center">MVP Orbit</h1>
+
+<p align="center">by MVP Lab.</p>
+
+<p align="center">
+  <a href="https://github.com/mvp-ai-lab/mvp-orbit/releases"><img alt="GitHub release" src="https://img.shields.io/github/v/release/mvp-ai-lab/mvp-orbit?style=flat-square"></a>
+  <img alt="Python 3.11+" src="https://img.shields.io/badge/python-%3E%3D3.11-3776AB?style=flat-square&logo=python&logoColor=white">
+  <img alt="CLI orbit" src="https://img.shields.io/badge/cli-orbit-111827?style=flat-square">
+  <img alt="Transport HTTP/SSE" src="https://img.shields.io/badge/transport-HTTP%20%2B%20SSE-0F766E?style=flat-square">
+  <img alt="Modes exec shell files" src="https://img.shields.io/badge/modes-exec%20%7C%20shell%20%7C%20files-7C3AED?style=flat-square">
+</p>
+
 ## What Orbit Is
 
-`mvp-orbit` is an HTTP-only peer command channel.
+`mvp-orbit` is a small HTTP-only peer command channel.
 
-One machine runs the control `host`. Each `client` joins a named channel with only:
+Run one control `host`, let multiple `client` machines join the same channel, approve new members from any existing client, then run commands, open shells, and move files between approved peers. Clients only need to reach the host; they do not need direct network access to each other.
 
-- a local alias
-- the host URL
-- the channel name
+## Features
 
-The first client in a channel is accepted automatically. Later clients create pending join requests, and any already-joined client in that channel can approve or reject them. After approval, members of the same channel can send commands, open shells, and transfer files through the host. Clients do not need direct network access to each other.
+- Simple join flow: `host URL` + local `alias` + `channel` name.
+- First client in a channel is accepted automatically.
+- Later clients require approval from any existing channel member.
+- Foreground `orbit join` clients can prompt directly when a new client asks to join.
+- Peer command mode: `orbit exec <peer> -- <command>` waits for output and exit status.
+- Interactive shell mode: `orbit sh <peer>` opens a live shell on the target client.
+- File transfer mode: `orbit put` and `orbit get`, with a default `1 MiB` limit.
+- HTTP/SSE transport through the host, with no direct client-to-client networking.
+- Automatic empty-channel cleanup on the host.
+
+## Quick Start
+
+### 1. Install or Run
+
+From a checkout:
+
+```bash
+uv run orbit --help
+```
+
+Install the current GitHub release wheel as a tool:
+
+```bash
+uv tool install https://github.com/mvp-ai-lab/mvp-orbit/releases/download/v0.6.0/mvp_orbit-0.6.0-py3-none-any.whl
+```
+
+### 2. Start the Host
+
+```bash
+orbit host
+```
+
+By default the host listens on `127.0.0.1:8080`. To accept clients from other machines:
+
+```bash
+ORBIT_HUB_HOST=0.0.0.0 orbit host
+```
+
+### 3. Join the First Client
+
+```bash
+orbit join --host http://HOST:8080 --alias client-a --channel team-a
+```
+
+`orbit join` stays in the foreground. Once joined, this process receives commands, shells, file requests, and join approvals.
+
+### 4. Join Another Client
+
+On another machine:
+
+```bash
+orbit join --host http://HOST:8080 --alias client-b --channel team-a
+```
+
+The first client sees an approval prompt:
+
+```text
+[orbit] new client join request
+  alias: client-b
+  channel: channel-...
+  request: join-...
+[orbit] approve this client? [y/N]:
+```
+
+If no interactive client is available, approve manually from any existing member:
+
+```bash
+orbit join-requests
+orbit approve <REQUEST_ID>
+```
+
+Reject a request with:
+
+```bash
+orbit reject <REQUEST_ID>
+```
+
+### 5. Use the Channel
+
+List peers:
+
+```bash
+orbit peers
+```
+
+Run one command and wait for the result:
+
+```bash
+orbit exec client-b -- uname -a
+orbit exec client-b --shell "cd /tmp && pwd && ls -la"
+```
+
+Open an interactive shell:
+
+```bash
+orbit sh client-b
+```
+
+Send a file to a peer:
+
+```bash
+orbit put client-b ./local.txt inbox/local.txt
+```
+
+Download a file from a peer:
+
+```bash
+orbit get client-b inbox/local.txt ./downloaded.txt
+```
+
+Raise the default `1 MiB` file limit only when needed:
+
+```bash
+orbit put --max-bytes 10485760 client-b ./model.bin models/model.bin
+orbit get --max-bytes 10485760 client-b models/model.bin ./model.bin
+```
+
+## How It Works
 
 ```mermaid
 flowchart LR
@@ -31,20 +153,11 @@ flowchart LR
     C <-->|"join approval\ncommands / shells / files"| H
 ```
 
-## Security Model
+The host stores channel state in SQLite and relays events. Each client keeps a foreground SSE connection to the host and posts command, shell, and file results back over HTTP.
 
-Channel membership is the trust boundary.
+## CLI Reference
 
-- The first client creates the channel and receives a member token.
-- Later clients cannot join until an existing member approves the join request.
-- A member token grants access to that channel until it expires.
-- Any approved member can execute commands on any other connected member.
-
-This is not a sandbox. Only approve clients and run commands in channels where every member is trusted.
-
-## Commands
-
-Public CLI commands are intentionally small:
+The public command surface is intentionally small:
 
 ```bash
 orbit host
@@ -59,107 +172,25 @@ orbit put <peer> <local> <remote>
 orbit get <peer> <remote> <local>
 ```
 
-`exec`, `sh`, and `put/get` are the only peer operation modes.
-
-## Quick Start
-
-### 1. Start the Host
+Useful `join` options:
 
 ```bash
-orbit host
+orbit join --no-start   # save config without starting the client loop
+orbit join --no-wait    # submit a join request and exit immediately
 ```
 
-The host stores channel state in SQLite and relays events over HTTP/SSE. By default it binds to `127.0.0.1:8080`; set `ORBIT_HUB_HOST=0.0.0.0` when it must listen on the network.
+Commands run inside the target client's workspace. `--working-dir` must stay inside that workspace. Relative remote file paths are resolved under the target client's workspace; absolute remote paths are allowed and should be used carefully.
 
-### 2. Join the First Client
+## Security Model
 
-```bash
-orbit join --host http://HOST:8080 --alias client-a --channel team-a
-```
+Channel membership is the trust boundary.
 
-`orbit join` is a foreground long-running process. After joining, it starts the client loop and keeps receiving commands, shells, file requests, and join approvals. If the process exits, that client stops receiving work.
+- The first client creates the channel and receives a member token.
+- Later clients cannot join until an existing member approves the join request.
+- A member token grants access to that channel until it expires.
+- Any approved member can execute commands on any other connected member.
 
-Use `--no-start` only when you want to save config without starting the client loop:
-
-```bash
-orbit join --host http://HOST:8080 --alias client-a --channel team-a --no-start
-```
-
-### 3. Join More Clients
-
-On another machine:
-
-```bash
-orbit join --host http://HOST:8080 --alias client-b --channel team-a
-```
-
-The new client waits for approval. Any foreground `orbit join` process already in the channel prompts directly:
-
-```text
-[orbit] new client join request
-  alias: client-b
-  channel: channel-...
-  request: join-...
-[orbit] approve this client? [y/N]:
-```
-
-If no client is running in an interactive terminal, approve manually from any existing member:
-
-```bash
-orbit join-requests
-orbit approve <REQUEST_ID>
-```
-
-Use `orbit reject <REQUEST_ID>` to deny a request. Use `--no-wait` on the joining client if it should submit the request and exit immediately.
-
-### 4. List Peers
-
-```bash
-orbit peers
-```
-
-### 5. Run One Command
-
-```bash
-orbit exec client-b -- uname -a
-```
-
-Use shell parsing when you need shell operators, variables, pipes, or `cd`:
-
-```bash
-orbit exec client-b --shell "cd /tmp && pwd && ls -la"
-```
-
-Commands run inside the target client's workspace. `--working-dir` must stay inside that workspace.
-
-### 6. Open an Interactive Shell
-
-```bash
-orbit sh client-b
-```
-
-### 7. Transfer Files
-
-Push a local file to a peer:
-
-```bash
-orbit put client-b ./local.txt inbox/local.txt
-```
-
-Pull a file from a peer:
-
-```bash
-orbit get client-b inbox/local.txt ./downloaded.txt
-```
-
-The default size limit is `1 MiB`. Raise it explicitly when needed:
-
-```bash
-orbit put --max-bytes 10485760 client-b ./model.bin models/model.bin
-orbit get --max-bytes 10485760 client-b models/model.bin ./model.bin
-```
-
-Relative remote paths are resolved under the target client's workspace. Absolute remote paths are allowed and should be used carefully.
+This is not a sandbox. Only approve clients and run commands in channels where every member is trusted.
 
 ## Configuration
 
