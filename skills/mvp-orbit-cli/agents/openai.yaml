@@ -1,4 +1,0 @@
-interface:
-  display_name: "MVP Orbit CLI"
-  short_description: "Operate mvp-orbit Hub, Agent, package, command, and shell flow"
-  default_prompt: "Use this skill to initialize mvp-orbit, upload packages when needed, execute commands on an agent, inspect command status or output, and manage remote shell sessions."

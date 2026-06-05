@@ -24,4 +24,4 @@ EXPOSE 8080
 
 VOLUME ["/var/lib/orbit"]
 
-CMD ["orbit", "hub", "serve"]
+CMD ["orbit", "host"]

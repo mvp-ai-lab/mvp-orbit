@@ -1,11 +1,13 @@
 from __future__ import annotations
 
-from typing import Any
 from datetime import datetime, timezone
 from enum import Enum
+from typing import Any
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+DEFAULT_FILE_MAX_BYTES = 1024 * 1024
 
 
 class CommandStatus(str, Enum):
@@ -23,49 +25,80 @@ class ShellSessionStatus(str, Enum):
     FAILED = "failed"
 
 
-class PackageRecord(BaseModel):
+class FileTransferStatus(str, Enum):
+    QUEUED = "queued"
+    RUNNING = "running"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+
+
+class JoinRequestStatus(str, Enum):
+    PENDING = "pending"
+    APPROVED = "approved"
+    REJECTED = "rejected"
+
+
+class ChannelRecord(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    package_id: str = Field(min_length=8)
-    size: int = Field(ge=0)
+    channel_id: str = Field(min_length=1)
     created_at: datetime
 
 
-class UserRecord(BaseModel):
+class ClientRecord(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    user_id: str = Field(min_length=1)
-    created_at: datetime
-
-
-class AgentRecord(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    agent_id: str = Field(min_length=1)
-    owner_user_id: str = Field(min_length=1)
+    client_id: str = Field(min_length=1)
+    channel_id: str = Field(min_length=1)
     created_at: datetime
     last_seen_at: datetime | None = None
 
 
-class ConnectRequest(BaseModel):
+class TokenResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    user_id: str = Field(min_length=1)
-
-
-class ConnectResponse(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    user_id: str = Field(min_length=1)
-    user_token: str = Field(min_length=1)
+    channel_id: str = Field(min_length=1)
+    member_token: str = Field(min_length=1)
     expires_at: datetime
+    alias: str | None = None
+
+
+class JoinRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    alias: str = Field(min_length=1)
+    channel: str = Field(min_length=1)
+
+
+class JoinResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    status: JoinRequestStatus
+    alias: str
+    channel_id: str
+    request_id: str | None = None
+    member_token: str | None = None
+    expires_at: datetime | None = None
+
+
+class JoinApprovalRecord(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    request_id: str
+    channel_id: str
+    alias: str
+    status: JoinRequestStatus
+    requested_at: datetime
+    approved_at: datetime | None = None
+    approved_by: str | None = None
+    rejected_at: datetime | None = None
+    rejected_by: str | None = None
 
 
 class CommandCreateRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    agent_id: str = Field(min_length=1)
-    package_id: str | None = None
+    client_id: str = Field(min_length=1)
     argv: list[str] = Field(min_length=1)
     env_patch: dict[str, str] = Field(default_factory=dict)
     timeout_sec: int = Field(default=3600, ge=1, le=86400)
@@ -76,9 +109,8 @@ class CommandRecord(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     command_id: str
-    agent_id: str
-    owner_user_id: str
-    package_id: str | None = None
+    client_id: str
+    channel_id: str
     argv: list[str]
     env_patch: dict[str, str] = Field(default_factory=dict)
     timeout_sec: int
@@ -99,8 +131,7 @@ class CommandLease(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     command_id: str
-    agent_id: str
-    package_id: str | None = None
+    client_id: str
     argv: list[str]
     env_patch: dict[str, str] = Field(default_factory=dict)
     timeout_sec: int
@@ -151,39 +182,37 @@ class EventRecord(BaseModel):
     created_at: datetime
 
 
-class AgentControlEvent(EventRecord):
+class ClientControlEvent(EventRecord):
     model_config = ConfigDict(extra="forbid")
 
-    agent_id: str = Field(min_length=1)
+    client_id: str = Field(min_length=1)
 
 
-class AgentEvent(BaseModel):
+class ClientEvent(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     kind: str = Field(min_length=1)
     payload: dict[str, Any] = Field(default_factory=dict)
 
 
-class AgentEventsRequest(BaseModel):
+class ClientEventsRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    events: list[AgentEvent] = Field(default_factory=list)
+    events: list[ClientEvent] = Field(default_factory=list)
 
 
 class ShellSessionCreateRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    agent_id: str = Field(min_length=1)
-    package_id: str | None = None
+    client_id: str = Field(min_length=1)
 
 
 class ShellSessionRecord(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     session_id: str
-    agent_id: str
-    owner_user_id: str
-    package_id: str | None = None
+    client_id: str
+    channel_id: str
     cwd_root: str
     status: ShellSessionStatus
     created_at: datetime
@@ -199,8 +228,7 @@ class ShellSessionLease(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     session_id: str
-    agent_id: str
-    package_id: str | None = None
+    client_id: str
     cwd_root: str
 
 
@@ -259,6 +287,53 @@ class ShellCompletionRequest(BaseModel):
         return value
 
 
+class FilePushRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    client_id: str = Field(min_length=1)
+    remote_path: str = Field(min_length=1)
+    data_b64: str = Field(min_length=1)
+    max_bytes: int = Field(default=DEFAULT_FILE_MAX_BYTES, ge=1)
+
+
+class FilePullRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    client_id: str = Field(min_length=1)
+    remote_path: str = Field(min_length=1)
+    max_bytes: int = Field(default=DEFAULT_FILE_MAX_BYTES, ge=1)
+
+
+class FileTransferRecord(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    transfer_id: str
+    client_id: str
+    channel_id: str
+    direction: str = Field(pattern="^(push|pull)$")
+    remote_path: str
+    size: int = Field(default=0, ge=0)
+    max_bytes: int = Field(default=DEFAULT_FILE_MAX_BYTES, ge=1)
+    status: FileTransferStatus
+    created_at: datetime
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+    failure_code: str | None = None
+    data_b64: str | None = None
+
+
+class FileTransferResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    transfer_id: str
+    status: FileTransferStatus
+    direction: str = Field(pattern="^(push|pull)$")
+    remote_path: str
+    size: int = Field(default=0, ge=0)
+    data_b64: str | None = None
+    failure_code: str | None = None
+
+
 def utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -269,3 +344,11 @@ def default_command_id() -> str:
 
 def default_shell_session_id() -> str:
     return f"shell-{uuid4().hex}"
+
+
+def default_file_transfer_id() -> str:
+    return f"file-{uuid4().hex}"
+
+
+def default_join_request_id() -> str:
+    return f"join-{uuid4().hex}"

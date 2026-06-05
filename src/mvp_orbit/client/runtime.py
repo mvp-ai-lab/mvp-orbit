@@ -1,26 +1,31 @@
 from __future__ import annotations
 
+import base64
 import fcntl
-import io
 import logging
 import os
 import pty
 import select
 import selectors
 import shlex
-import shutil
 import signal
 import struct
 import subprocess
-import tarfile
 import termios
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
-from mvp_orbit.core.canonical import require_matching_object_id
-from mvp_orbit.core.models import CommandLease, CommandStatus, ShellSessionLease, ShellSessionStatus
+from mvp_orbit.core.logging import log_kv
+from mvp_orbit.core.models import (
+    CommandLease,
+    CommandStatus,
+    FileTransferResult,
+    FileTransferStatus,
+    ShellSessionLease,
+    ShellSessionStatus,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -39,21 +44,18 @@ class ShellExecutionOutcome:
     failure_code: str | None = None
 
 
-class AgentRuntime:
+class ClientRuntime:
     def __init__(
         self,
         *,
-        agent_id: str,
+        client_id: str,
         base_workspace: str | Path,
-        heartbeat_interval_sec: float | None = None,
         command_output_chunk_bytes: int = 4096,
         command_output_flush_interval_sec: float = 0.1,
     ) -> None:
-        self.agent_id = agent_id
+        self.client_id = client_id
         self.base_workspace = Path(base_workspace).resolve()
         self.base_workspace.mkdir(parents=True, exist_ok=True)
-        self.packages_root = self.base_workspace / ".orbit" / "packages"
-        self.packages_root.mkdir(parents=True, exist_ok=True)
         self.command_output_chunk_bytes = max(64, command_output_chunk_bytes)
         self.command_output_flush_interval_sec = max(0.01, command_output_flush_interval_sec)
 
@@ -61,22 +63,13 @@ class AgentRuntime:
         self,
         lease: CommandLease,
         *,
-        fetch_package: Callable[[str], bytes],
         on_started: Callable[[], None],
         append_output: Callable[[str, str], None],
         should_cancel: Callable[[], bool],
     ) -> CommandExecutionOutcome:
-        workspace = self._command_workspace(lease, fetch_package)
-        cwd = self._resolve_working_dir(workspace, lease.working_dir)
+        cwd = self._resolve_working_dir(lease.working_dir)
         env = self._merged_env(lease.env_patch)
-        logger.info(
-            "agent %s starting command %s in %s package_id=%s argv=%s",
-            self.agent_id,
-            lease.command_id,
-            cwd,
-            lease.package_id or "-",
-            shlex.join(lease.argv),
-        )
+        log_kv(logger, logging.INFO, "command.start", client_id=self.client_id, command_id=lease.command_id, cwd=cwd, argv=shlex.join(lease.argv))
 
         proc = subprocess.Popen(
             lease.argv,
@@ -143,21 +136,14 @@ class AgentRuntime:
         self,
         lease: ShellSessionLease,
         *,
-        fetch_package: Callable[[str], bytes],
         on_started: Callable[[], None],
         append_output: Callable[[str], None],
         pop_input: Callable[[], list[bytes]],
         pop_resize: Callable[[], list[tuple[int, int]]],
         should_close: Callable[[], bool],
     ) -> ShellExecutionOutcome:
-        workspace = self._shell_workspace(lease, fetch_package)
-        logger.info(
-            "agent %s starting shell session %s in %s package_id=%s",
-            self.agent_id,
-            lease.session_id,
-            workspace,
-            lease.package_id or "-",
-        )
+        workspace = self.base_workspace
+        log_kv(logger, logging.INFO, "shell.start", client_id=self.client_id, session_id=lease.session_id, workspace=workspace)
         master_fd, slave_fd = pty.openpty()
         proc = subprocess.Popen(
             self._shell_argv(),
@@ -225,39 +211,85 @@ class AgentRuntime:
             except OSError:
                 pass
 
-    def _command_workspace(self, lease: CommandLease, fetch_package: Callable[[str], bytes]) -> Path:
-        if lease.package_id is None:
-            return self.base_workspace
-        return self._ensure_package_workspace(lease.package_id, fetch_package)
+    def handle_file_push(self, *, transfer_id: str, remote_path: str, data_b64: str, max_bytes: int) -> FileTransferResult:
+        try:
+            data = base64.b64decode(data_b64.encode("ascii"), validate=True)
+            if len(data) > max_bytes:
+                return FileTransferResult(
+                    transfer_id=transfer_id,
+                    status=FileTransferStatus.FAILED,
+                    direction="push",
+                    remote_path=remote_path,
+                    size=len(data),
+                    failure_code="too_large",
+                )
+            path = self._resolve_remote_file(remote_path)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(data)
+            return FileTransferResult(
+                transfer_id=transfer_id,
+                status=FileTransferStatus.SUCCEEDED,
+                direction="push",
+                remote_path=remote_path,
+                size=len(data),
+            )
+        except Exception as exc:
+            log_kv(logger, logging.WARNING, "file.push.failed", client_id=self.client_id, remote_path=remote_path, error=exc.__class__.__name__)
+            return FileTransferResult(
+                transfer_id=transfer_id,
+                status=FileTransferStatus.FAILED,
+                direction="push",
+                remote_path=remote_path,
+                size=0,
+                failure_code=exc.__class__.__name__,
+            )
 
-    def _shell_workspace(self, lease: ShellSessionLease, fetch_package: Callable[[str], bytes]) -> Path:
-        if lease.package_id is None:
-            return self.base_workspace
-        return self._ensure_package_workspace(lease.package_id, fetch_package)
+    def handle_file_pull(self, *, transfer_id: str, remote_path: str, max_bytes: int) -> FileTransferResult:
+        try:
+            path = self._resolve_remote_file(remote_path)
+            size = path.stat().st_size
+            if size > max_bytes:
+                return FileTransferResult(
+                    transfer_id=transfer_id,
+                    status=FileTransferStatus.FAILED,
+                    direction="pull",
+                    remote_path=remote_path,
+                    size=size,
+                    failure_code="too_large",
+                )
+            data = path.read_bytes()
+            return FileTransferResult(
+                transfer_id=transfer_id,
+                status=FileTransferStatus.SUCCEEDED,
+                direction="pull",
+                remote_path=remote_path,
+                size=len(data),
+                data_b64=base64.b64encode(data).decode("ascii"),
+            )
+        except Exception as exc:
+            log_kv(logger, logging.WARNING, "file.pull.failed", client_id=self.client_id, remote_path=remote_path, error=exc.__class__.__name__)
+            return FileTransferResult(
+                transfer_id=transfer_id,
+                status=FileTransferStatus.FAILED,
+                direction="pull",
+                remote_path=remote_path,
+                size=0,
+                failure_code=exc.__class__.__name__,
+            )
 
-    def _ensure_package_workspace(self, package_id: str, fetch_package: Callable[[str], bytes]) -> Path:
-        workspace = self.packages_root / package_id
-        marker = workspace / ".orbit-ready"
-        if marker.exists():
-            return workspace
-
-        package_bytes = fetch_package(package_id)
-        require_matching_object_id(package_id, package_bytes)
-        if workspace.exists():
-            shutil.rmtree(workspace)
-        workspace.mkdir(parents=True, exist_ok=True)
-        with tarfile.open(fileobj=io.BytesIO(package_bytes), mode="r:gz") as tar:
-            self._extract_safely(tar, workspace)
-        marker.write_text("ready\n", encoding="utf-8")
-        return workspace
-
-    def _resolve_working_dir(self, workspace: Path, working_dir: str) -> Path:
-        cwd = (workspace / working_dir).resolve()
-        workspace_root = workspace.resolve()
-        if cwd != workspace_root and workspace_root not in cwd.parents:
+    def _resolve_working_dir(self, working_dir: str) -> Path:
+        cwd = (self.base_workspace / working_dir).resolve()
+        root = self.base_workspace.resolve()
+        if cwd != root and root not in cwd.parents:
             raise RuntimeError("command working_dir escapes workspace")
         cwd.mkdir(parents=True, exist_ok=True)
         return cwd
+
+    def _resolve_remote_file(self, remote_path: str) -> Path:
+        path = Path(remote_path).expanduser()
+        if path.is_absolute():
+            return path
+        return (self.base_workspace / path).resolve()
 
     @staticmethod
     def _merged_env(patch: dict[str, str]) -> dict[str, str]:
@@ -295,12 +327,3 @@ class AgentRuntime:
     def _set_winsize(fd: int, rows: int, cols: int) -> None:
         winsize = struct.pack("HHHH", rows, cols, 0, 0)
         fcntl.ioctl(fd, termios.TIOCSWINSZ, winsize)
-
-    @staticmethod
-    def _extract_safely(tar: tarfile.TarFile, destination: Path) -> None:
-        root = destination.resolve()
-        for member in tar.getmembers():
-            target = (destination / member.name).resolve()
-            if target != root and root not in target.parents:
-                raise RuntimeError(f"package member escapes workspace: {member.name}")
-        tar.extractall(destination)

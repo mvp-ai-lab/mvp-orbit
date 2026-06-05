@@ -3,14 +3,17 @@ from __future__ import annotations
 import json
 import logging
 import queue
+import sys
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 import httpx
 
-from mvp_orbit.agent.runtime import AgentRuntime
-from mvp_orbit.core.models import AgentEvent, AgentEventsRequest, CommandLease, ShellSessionLease
+from mvp_orbit.client.runtime import ClientRuntime
+from mvp_orbit.core.logging import log_kv
+from mvp_orbit.core.models import ClientEvent, ClientEventsRequest, CommandLease, FileTransferResult, ShellSessionLease
 
 logger = logging.getLogger(__name__)
 
@@ -43,11 +46,13 @@ class _ShellControl:
 
 
 @dataclass
-class AgentService:
-    agent_id: str
+class ClientService:
+    client_id: str
     hub_url: str
-    runtime: AgentRuntime
-    user_token: str | None = None
+    runtime: ClientRuntime
+    member_token: str | None = None
+    heartbeat_interval_sec: float = 15.0
+    join_request_prompt: Callable[[dict], bool | None] | None = None
 
     def __post_init__(self) -> None:
         self._command_cancels: dict[str, threading.Event] = {}
@@ -56,13 +61,16 @@ class AgentService:
 
     def _headers(self, *, accept: str = "application/json") -> dict[str, str]:
         headers = {"Accept": accept}
-        if self.user_token:
-            headers["Authorization"] = f"Bearer {self.user_token}"
+        if self.member_token:
+            headers["Authorization"] = f"Bearer {self.member_token}"
         return headers
 
     def run_forever(self, client: httpx.Client | None = None) -> None:
         timeout = httpx.Timeout(connect=5.0, read=None, write=10.0, pool=10.0)
         own_client = client is None
+        stop_heartbeat = threading.Event()
+        heartbeat_thread = threading.Thread(target=self._heartbeat_loop, args=(stop_heartbeat,), daemon=True)
+        heartbeat_thread.start()
         if client is None:
             client = httpx.Client(timeout=timeout)
         try:
@@ -70,14 +78,27 @@ class AgentService:
                 try:
                     self._consume_stream(client)
                 except TokenExpiredError as exc:
-                    logger.error("agent %s token expired; run `orbit connect` again and restart the agent", self.agent_id)
+                    log_kv(logger, logging.ERROR, "client.token_expired", client_id=self.client_id, action="run orbit join again")
                     raise RuntimeError("token expired") from exc
                 except (httpx.RequestError, httpx.HTTPStatusError) as exc:
-                    logger.warning("agent %s stream error: %s", self.agent_id, exc)
+                    log_kv(logger, logging.WARNING, "client.stream_error", client_id=self.client_id, error=exc.__class__.__name__, detail=exc)
                     time.sleep(1.0)
         finally:
+            stop_heartbeat.set()
+            heartbeat_thread.join(timeout=2.0)
             if own_client:
                 client.close()
+
+    def _heartbeat_loop(self, stop: threading.Event) -> None:
+        interval = max(1.0, float(self.heartbeat_interval_sec))
+        timeout = httpx.Timeout(connect=5.0, read=10.0, write=10.0, pool=5.0)
+        with httpx.Client(timeout=timeout) as client:
+            while not stop.is_set():
+                try:
+                    self._post_client_events(client, [ClientEvent(kind="client.heartbeat", payload={})])
+                except Exception as exc:
+                    log_kv(logger, logging.DEBUG, "client.heartbeat_failed", client_id=self.client_id, error=exc.__class__.__name__, detail=exc)
+                stop.wait(interval)
 
     def _consume_stream(self, client: httpx.Client) -> None:
         headers = self._headers(accept="text/event-stream")
@@ -85,7 +106,7 @@ class AgentService:
             headers["Last-Event-ID"] = str(self._last_event_id)
         with client.stream(
             "GET",
-            f"{self.hub_url}/api/agents/{self.agent_id}/stream",
+            f"{self.hub_url}/api/clients/{self.client_id}/stream",
             headers=headers,
         ) as response:
             self._raise_for_status(response)
@@ -154,7 +175,61 @@ class AgentService:
             if control is not None:
                 control.close_requested.set()
             return
-        logger.warning("agent %s ignored unknown control event kind=%s", self.agent_id, kind)
+        if kind == "file.push":
+            thread = threading.Thread(target=self._handle_file_push, args=(client, payload), daemon=True)
+            thread.start()
+            return
+        if kind == "file.pull":
+            thread = threading.Thread(target=self._handle_file_pull, args=(client, payload), daemon=True)
+            thread.start()
+            return
+        if kind == "join.request":
+            self._handle_join_request(client, payload)
+            return
+        log_kv(logger, logging.WARNING, "control.unknown", client_id=self.client_id, kind=kind)
+
+    def _handle_join_request(self, client: httpx.Client, payload: dict) -> None:
+        request_id = str(payload.get("request_id") or "")
+        alias = str(payload.get("alias") or "")
+        if not request_id:
+            log_kv(logger, logging.WARNING, "join_request.malformed", client_id=self.client_id, payload=payload)
+            return
+
+        decision = self._prompt_join_request(payload)
+        if decision is None:
+            log_kv(logger, logging.INFO, "join_request.pending", client_id=self.client_id, request_id=request_id, alias=alias or "-", action=f"orbit approve {request_id}")
+            return
+
+        action = "approve" if decision else "reject"
+        response = client.post(
+            f"{self.hub_url}/api/join-requests/{request_id}/{action}",
+            headers=self._headers(),
+        )
+        self._raise_for_status(response)
+        status_text = "approved" if decision else "rejected"
+        print(f"[orbit] join request {request_id} {status_text}", file=sys.stderr, flush=True)
+
+    def _prompt_join_request(self, payload: dict) -> bool | None:
+        if self.join_request_prompt is not None:
+            return self.join_request_prompt(payload)
+        if not (sys.stdin.isatty() and sys.stderr.isatty()):
+            return None
+
+        request_id = str(payload.get("request_id") or "")
+        alias = str(payload.get("alias") or "unknown")
+        channel_id = str(payload.get("channel_id") or "unknown")
+        print("", file=sys.stderr)
+        print("[orbit] new client join request", file=sys.stderr)
+        print(f"  alias: {alias}", file=sys.stderr)
+        print(f"  channel: {channel_id}", file=sys.stderr)
+        print(f"  request: {request_id}", file=sys.stderr)
+        while True:
+            answer = input("[orbit] approve this client? [y/N]: ").strip().lower()
+            if answer in {"y", "yes"}:
+                return True
+            if answer in {"", "n", "no"}:
+                return False
+            print("enter y or n", file=sys.stderr)
 
     def _run_command(self, client: httpx.Client, command_id: str, cancel_event: threading.Event) -> None:
         try:
@@ -164,21 +239,20 @@ class AgentService:
             return
         outcome = self.runtime.handle_command(
             lease,
-            fetch_package=lambda package_id: self._fetch_package(client, package_id),
-            on_started=lambda: self._post_agent_events(
+            on_started=lambda: self._post_client_events(
                 client,
-                [AgentEvent(kind="command.started", payload={"command_id": command_id})],
+                [ClientEvent(kind="command.started", payload={"command_id": command_id})],
             ),
-            append_output=lambda stream, data: self._post_agent_events(
+            append_output=lambda stream, data: self._post_client_events(
                 client,
-                [AgentEvent(kind=f"command.{stream}", payload={"command_id": command_id, "data": data})],
+                [ClientEvent(kind=f"command.{stream}", payload={"command_id": command_id, "data": data})],
             ),
             should_cancel=cancel_event.is_set,
         )
-        self._post_agent_events(
+        self._post_client_events(
             client,
             [
-                AgentEvent(
+                ClientEvent(
                     kind="command.exit",
                     payload={
                         "command_id": command_id,
@@ -199,24 +273,23 @@ class AgentService:
             return
         outcome = self.runtime.handle_shell_session(
             lease,
-            fetch_package=lambda package_id: self._fetch_package(client, package_id),
-            on_started=lambda: self._post_agent_events(
+            on_started=lambda: self._post_client_events(
                 client,
-                [AgentEvent(kind="shell.started", payload={"session_id": session_id})],
+                [ClientEvent(kind="shell.started", payload={"session_id": session_id})],
             ),
-            append_output=lambda data: self._post_agent_events(
+            append_output=lambda data: self._post_client_events(
                 client,
-                [AgentEvent(kind="shell.stdout", payload={"session_id": session_id, "data": data})],
+                [ClientEvent(kind="shell.stdout", payload={"session_id": session_id, "data": data})],
             ),
             pop_input=control.pop_inputs,
             pop_resize=control.pop_resizes,
             should_close=control.close_requested.is_set,
         )
         final_kind = "shell.closed" if outcome.status.value == "closed" else "shell.exit"
-        self._post_agent_events(
+        self._post_client_events(
             client,
             [
-                AgentEvent(
+                ClientEvent(
                     kind=final_kind,
                     payload={
                         "session_id": session_id,
@@ -228,6 +301,33 @@ class AgentService:
             ],
         )
         self._shell_controls.pop(session_id, None)
+
+    def _handle_file_push(self, client: httpx.Client, payload: dict) -> None:
+        transfer_id = str(payload["transfer_id"])
+        self._post_client_events(client, [ClientEvent(kind="file.started", payload={"transfer_id": transfer_id})])
+        result = self.runtime.handle_file_push(
+            transfer_id=transfer_id,
+            remote_path=str(payload["remote_path"]),
+            data_b64=str(payload["data_b64"]),
+            max_bytes=int(payload.get("max_bytes", 1024 * 1024)),
+        )
+        self._post_file_result(client, result)
+
+    def _handle_file_pull(self, client: httpx.Client, payload: dict) -> None:
+        transfer_id = str(payload["transfer_id"])
+        self._post_client_events(client, [ClientEvent(kind="file.started", payload={"transfer_id": transfer_id})])
+        result = self.runtime.handle_file_pull(
+            transfer_id=transfer_id,
+            remote_path=str(payload["remote_path"]),
+            max_bytes=int(payload.get("max_bytes", 1024 * 1024)),
+        )
+        self._post_file_result(client, result)
+
+    def _post_file_result(self, client: httpx.Client, result: FileTransferResult) -> None:
+        self._post_client_events(
+            client,
+            [ClientEvent(kind="file.result", payload=result.model_dump(mode="json"))],
+        )
 
     def _claim_command(self, client: httpx.Client, command_id: str) -> CommandLease:
         response = client.post(f"{self.hub_url}/api/commands/{command_id}/claim", headers=self._headers())
@@ -243,18 +343,13 @@ class AgentService:
         self._raise_for_status(response)
         return ShellSessionLease.model_validate(response.json())
 
-    def _fetch_package(self, client: httpx.Client, package_id: str) -> bytes:
-        response = client.get(f"{self.hub_url}/api/packages/{package_id}", headers=self._headers())
-        self._raise_for_status(response)
-        return response.content
-
-    def _post_agent_events(self, client: httpx.Client, events: list[AgentEvent]) -> None:
+    def _post_client_events(self, client: httpx.Client, events: list[ClientEvent]) -> None:
         if not events:
             return
         response = client.post(
-            f"{self.hub_url}/api/agents/{self.agent_id}/events",
+            f"{self.hub_url}/api/clients/{self.client_id}/events",
             headers=self._headers(),
-            json=AgentEventsRequest(events=events).model_dump(mode="json"),
+            json=ClientEventsRequest(events=events).model_dump(mode="json"),
         )
         self._raise_for_status(response)
 

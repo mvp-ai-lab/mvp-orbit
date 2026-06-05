@@ -7,297 +7,232 @@
 </p>
 
 <div align="center">by MVP Lab.</div>
+## Orbit 是什么
 
-## 为什么是 Orbit
+`mvp-orbit` 是一个纯 HTTP 的 peer 命令 channel。
 
-`mvp-orbit` 是一个纯 HTTP 的轻量远程执行闭环，面向这样一类工作流：
+一台机器运行控制 `host`。每台 `client` 加入某个命名 channel 时只需要提供：
 
-1. 在一台机器上准备代码
-2. 把代码发送到另一台机器
-3. 在目标机器上执行命令
-4. 立刻把输出实时回传
+- 本机别名
+- host 地址
+- channel 名称
 
-它尤其适合这些场景：
-
-- 无法使用 SSH，或不想依赖 SSH
-- 需要稳定重复执行的远程调试流程
-- AI coding agent 的远程执行
-- GPU / NPU / 嵌入式设备调试
-- 一台机器构建，另一台机器运行
-
-## 角色
-
-Orbit 有三个彼此解耦的角色：
-
-- `Hub`
-  控制平面，负责保存 package、command、shell session、token、归属关系和实时事件日志。
-- `Agent`
-  执行端。Agent 会和 Hub 建立一个长期 SSE 控制流，在本地执行命令，然后通过普通 HTTP POST 回传事件。
-- `User`
-  指令发送端。User 通过 Hub 向指定 Agent 发送命令。
+第一个加入 channel 的 client 会自动通过。后续 client 会创建 pending join request，任意已经加入该 channel 的 client 都可以批准或拒绝。审批通过后，同一 channel 的成员可以通过 host 发送命令、打开 shell、传输文件。client 之间不需要彼此直连。
 
 ```mermaid
 flowchart LR
-    U["User<br/>指令发送端"]
-    H["Hub<br/>控制平面"]
-    A["Agent<br/>执行端"]
+    H["控制 host\nHTTP + SSE 转发"]
+    A["client-a"]
+    B["client-b"]
+    C["client-c"]
 
-    U -->|"orbit connect<br/>package upload<br/>cmd exec<br/>shell start"| H
-    U <-->|"命令 SSE 流<br/>shell SSE 流"| H
-    A <-->|"SSE 控制流<br/>HTTP 事件回传"| H
+    A <-->|"加入审批\n命令 / shell / 文件"| H
+    B <-->|"加入审批\n命令 / shell / 文件"| H
+    C <-->|"加入审批\n命令 / shell / 文件"| H
 ```
 
-这意味着 Hub 可以部署在独立服务器上。运行时只要求：
+## 安全模型
 
-- User 机器可以通过 HTTP 或 HTTPS 访问 Hub
-- Agent 机器可以通过 HTTP 或 HTTPS 访问 Hub
+Channel 成员关系就是信任边界。
 
-User 和 Agent 之间不需要直接互通。
+- 第一个 client 创建 channel，并获得 member token。
+- 后续 client 必须被已有成员审批后才能加入。
+- member token 在过期前可访问该 channel。
+- 任意已批准成员都可以对任意在线成员执行命令。
 
-## 归属与认证
+这不是沙箱。只应该批准可信 client，也只应该在可信 channel 里执行命令。
 
-每个 Agent 都只属于一个 `user_id`。
+## 命令
 
-- Agent 第一次成功建立控制流时，会把该 `agent_id` 注册到当前用户下。
-- 之后，只有同一个用户才能向该 Agent 提交命令、打开 shell 或读取输出。
-- 不同用户的 Agent 彼此隔离，不能混用。
-- package 的访问权限也是按用户隔离的；即使两个用户上传了完全相同的内容并得到相同的 `package_id`，权限仍然分开。
+公开 CLI 命令刻意保持很小：
 
-Orbit 使用两类 token：
-
-- `bootstrap_token`
-  Hub 侧引导凭证，只用于 `orbit connect`。
-- `user_token`
-  运行时凭证，用户侧 CLI 和 Agent 访问 Hub API 时都使用它。
-
-正常运行时，几乎所有 Hub API 通信都只使用 `user_token`。
-
-`bootstrap_token` 的唯一职责，是帮助某个用户换取 7 天有效的 `user_token`：
-
-```text
-bootstrap_token -> orbit connect -> user_token -> 日常 Hub API 通信
+```bash
+orbit host
+orbit join
+orbit join-requests
+orbit approve <REQUEST_ID>
+orbit reject <REQUEST_ID>
+orbit peers
+orbit exec <peer> -- <command>
+orbit sh <peer>
+orbit put <peer> <local> <remote>
+orbit get <peer> <remote> <local>
 ```
 
-需要注意：
-
-- 控制端和 Agent 端不要求持有完全相同的 token 字符串。
-- 但它们必须属于同一个 `user_id`，这样控制端才能操作该用户名下的 Agent。
-- `orbit connect` 会打印一个 `ORBIT_AGENT_CONFIG_STRING`，可以复制到另一台机器上使用。
-- `orbit init node` / `orbit init agent` 可以消费这个 config-string，但 `agent_id` 仍然在 Agent 机器本地输入。
-
-## 运行模型
-
-Orbit 围绕三个面向用户的动作构建：
-
-- `package`
-  把目录打成确定性的 `.tar.gz` 并上传到 Hub。
-- `cmd exec`
-  把一条命令发送给指定 Agent。`package_id` 可选。
-- `shell`
-  打开一个持久的远程 shell，会话具有 PTY 语义并支持重连。
-
-关键运行语义：
-
-- Hub、CLI 和 Agent 之间只通过 HTTP 通信。
-- 实时链路采用 `SSE 下行 + POST 上行`。
-- Agent 启动目录就是基础工作区，除非配置了 `workspace_root`。
-- 不带 `package_id` 的命令直接在基础工作区执行。
-- 带 `package_id` 的命令会在基础工作区下对应的 package 子目录执行。
-- shell 默认在基础工作区启动；如果提供了 `package_id`，则在对应 package 工作区启动。
-- `cmd exec` 默认会等待并流式打印输出；只有加 `--detach` 才会立即返回。
-- `cmd exec` 和 `cmd output --follow` 会根据远端终态返回本地退出码，并在 `stderr` 打一行摘要。
+`exec`、`sh`、`put/get` 是仅有的三类 peer 操作模式。
 
 ## 快速开始
 
-### 1. 启动 Hub
-
-在 Hub 机器上执行：
+### 1. 启动 Host
 
 ```bash
-orbit init hub
-orbit hub serve
+orbit host
 ```
 
-`orbit init hub` 会写入 Hub 配置，并输出给 `orbit connect` 使用的 `bootstrap_token`。
+host 使用 SQLite 保存 channel 状态，并通过 HTTP/SSE 转发事件。默认监听 `127.0.0.1:8080`；如果需要对网络开放，设置 `ORBIT_HUB_HOST=0.0.0.0`。
 
-### 2. 以用户身份 connect
-
-在 User 机器上执行：
+### 2. 第一台 Client 加入
 
 ```bash
-orbit connect
+orbit join --host http://HOST:8080 --alias client-a --channel team-a
 ```
 
-`orbit connect` 会要求输入：
+`orbit join` 是前台常驻进程。加入成功后，它会启动 client loop，持续接收命令、shell、文件请求和加入审批。如果进程退出，这台 client 就不能再接收任务。
 
-- Hub URL
-- `user_id`
-- Hub 的 `bootstrap_token`
+只想保存配置、不启动 client loop 时使用 `--no-start`：
 
-然后把 `user_token` 和 `expires_at` 写入本地配置，并打印：
+```bash
+orbit join --host http://HOST:8080 --alias client-a --channel team-a --no-start
+```
+
+### 3. 更多 Client 加入
+
+另一台机器执行：
+
+```bash
+orbit join --host http://HOST:8080 --alias client-b --channel team-a
+```
+
+新 client 会等待审批。同一 channel 内任意正在前台运行的 `orbit join` 进程会直接弹出确认：
 
 ```text
-ORBIT_AGENT_CONFIG_STRING=orbit-agent-config-string-v1:...
+[orbit] new client join request
+  alias: client-b
+  channel: channel-...
+  request: join-...
+[orbit] approve this client? [y/N]:
 ```
 
-### 3. 初始化并启动 Agent
-
-在 Agent 机器上执行：
+如果没有交互式终端里的 client 进程，可以从任意已有成员手动审批：
 
 ```bash
-orbit init agent --config-string 'orbit-agent-config-string-v1:...' --agent-id agent-a
-orbit agent run
+orbit join-requests
+orbit approve <REQUEST_ID>
 ```
 
-也可以走交互式流程：
+拒绝请求使用 `orbit reject <REQUEST_ID>`。如果新 client 只想提交申请后立即退出，可以加 `--no-wait`。
+
+### 4. 查看 Peers
 
 ```bash
-orbit init agent
+orbit peers
 ```
 
-然后粘贴 config-string，再在本地输入 `agent_id`。
-
-当 Agent 成功建立控制流后，该 `agent_id` 就会归属到当前用户。
-
-## 常用流程
-
-### 上传文件包
+### 5. 执行单条命令
 
 ```bash
-orbit package upload --source-dir /path/to/project
+orbit exec client-b -- uname -a
 ```
 
-示例返回：
-
-```json
-{
-  "package_id": "sha256-...",
-  "size": 12345,
-  "created_at": "2026-03-10T00:00:00+00:00"
-}
-```
-
-### 在 Agent 基础工作区执行命令
+需要 shell 操作符、变量、管道或 `cd` 时使用 `--shell`：
 
 ```bash
-orbit cmd exec \
-  --agent-id agent-a \
-  -- pwd
+orbit exec client-b --shell "cd /tmp && pwd && ls -la"
 ```
 
-### 在上传的 package 上执行命令
+命令在目标 client 的 workspace 内执行。`--working-dir` 必须保持在该 workspace 内。
+
+### 6. 打开交互式 Shell
 
 ```bash
-orbit cmd exec \
-  --agent-id agent-a \
-  --package-id <PACKAGE_ID> \
-  -- python3 train.py --epochs 1
+orbit sh client-b
 ```
 
-### 执行复合 shell 命令
+### 7. 传输文件
+
+发送本地文件到对端：
 
 ```bash
-orbit cmd exec \
-  --agent-id agent-a \
-  --shell \
-  "cd /cache/models && HF_TOKEN=hf_xxx hf download repo --local-dir model-dir"
+orbit put client-b ./local.txt inbox/local.txt
 ```
 
-当远端命令需要以下 shell 能力时，请使用 `--shell`：
-
-- `cd`
-- `&&`
-- 管道
-- 重定向
-- 内联环境变量
-
-### 只提交，不等待
+从对端下载文件：
 
 ```bash
-orbit cmd exec \
-  --agent-id agent-a \
-  --package-id <PACKAGE_ID> \
-  --detach \
-  -- python3 train.py
+orbit get client-b inbox/local.txt ./downloaded.txt
 ```
 
-之后再查看：
+默认大小限制是 `1 MiB`。需要更大文件时显式提高：
 
 ```bash
-orbit cmd status --command-id <COMMAND_ID>
-orbit cmd output --command-id <COMMAND_ID>
-orbit cmd output --command-id <COMMAND_ID> --follow
-orbit cmd cancel --command-id <COMMAND_ID>
+orbit put --max-bytes 10485760 client-b ./model.bin models/model.bin
+orbit get --max-bytes 10485760 client-b models/model.bin ./model.bin
 ```
 
-说明：
-
-- `orbit cmd exec` 默认会流式输出并等待结束，除非使用 `--detach`。
-- `orbit cmd output --follow` 用于重新 attach 到 detached command，同时会在结束时打印摘要并返回映射后的本地退出码。
-
-### 打开远程 shell
-
-基础工作区：
-
-```bash
-orbit shell start --agent-id agent-a
-```
-
-package 工作区：
-
-```bash
-orbit shell start --agent-id agent-a --package-id <PACKAGE_ID>
-```
-
-管理会话：
-
-```bash
-orbit shell list
-orbit shell list --agent-id agent-a
-orbit shell attach --session-id <SESSION_ID>
-orbit shell close --session-id <SESSION_ID>
-```
-
-说明：
-
-- `orbit shell start` 在本地是 TTY 时会立即 attach；加 `--detach` 才只打印 `session_id`。
-- `orbit shell attach` 提供 PTY 语义的远程 shell。
-- 如果要显式关闭远端 shell，请使用 `orbit shell close --session-id <SESSION_ID>`。
+相对 remote path 会解析到目标 client 的 workspace 下。绝对 remote path 也允许，但应谨慎使用。
 
 ## 配置
 
-默认配置文件路径：
+默认配置文件是：
 
 ```text
 ~/.config/mvp-orbit/config.toml
 ```
 
-当前配置结构：
+`orbit join` 会写入 host URL、本机 client 别名、member token 和 token 过期时间。非 join 命令会自动读取这个配置。也可以用 `--hub-url`、`--member-token`、`--token-expires-at` 覆盖。
 
-```toml
-[hub]
-host = "127.0.0.1"
-port = 8080
-db = "./.orbit-hub/hub.sqlite3"
-object_root = "./.orbit-hub/objects"
-url = "http://127.0.0.1:8080"
+常用运行环境变量：
 
-[auth]
-bootstrap_token = "..."  # 给 orbit connect 使用
-user_token = "..."       # 给 CLI 和 Agent 运行时使用
-expires_at = "2026-03-18T12:34:56+00:00"
-
-[agent]
-id = "agent-a"
-workspace_root = "./workspace"
+```bash
+ORBIT_CONFIG=~/.config/mvp-orbit/config.toml
+ORBIT_WORKSPACE_ROOT=/path/to/workspace
+ORBIT_HEARTBEAT_SEC=15
+ORBIT_LOG_LEVEL=INFO      # DEBUG, INFO, WARNING, ERROR
+NO_COLOR=1               # 禁用 ANSI 颜色
 ```
 
-## 旧概念说明
+Host 环境变量：
 
-下面这些旧概念已经不再属于当前版本：
+```bash
+ORBIT_HUB_HOST=127.0.0.1
+ORBIT_HUB_PORT=8080
+ORBIT_HUB_DB=./.orbit-hub/hub.sqlite3
+ORBIT_OBJECT_ROOT=./.orbit-hub/objects
+ORBIT_ACCESS_LOG=0        # 设为 1 可打开 uvicorn HTTP access log
+```
 
-- Agent 轮询式取任务
-- `commands/next` 和 `shells/next`
-- `ORBIT_AGENT_INIT` 之类的 bundle 字符串
-- `--shared-config`
-- 旧的 run/task 对象工作流
+## 空 Channel 自动清理
+
+host 会自动删除没有在线 client 的 channel。`orbit join` 运行时会发送 heartbeat。若某个 channel 在 `ORBIT_CLIENT_OFFLINE_SEC` 内没有任何 client 更新在线状态，并且超过 `ORBIT_CHANNEL_EMPTY_TTL_SEC` 没有活动，就会被删除。
+
+默认值：
+
+```bash
+ORBIT_CHANNEL_CLEANUP_ENABLED=1
+ORBIT_CLIENT_OFFLINE_SEC=90
+ORBIT_CHANNEL_EMPTY_TTL_SEC=3600
+ORBIT_CHANNEL_CLEANUP_INTERVAL_SEC=60
+```
+
+删除 channel 会同时清理该 channel 的已批准成员、待审批请求、过期 client 记录、token、命令历史、shell 历史和文件传输历史。
+
+## 日志
+
+运行时日志使用紧凑的结构化单行格式：
+
+```text
+[15:52:34] INFO    client │ client.runtime     │ command.start client_id=client-a argv="python3 -V"
+```
+
+消息部分使用 `event key=value`，方便搜索和解析。
+
+## Docker Host
+
+Dockerfile 运行的是 host：
+
+```bash
+docker build -t mvp-orbit .
+docker run --rm -p 8080:8080 -v orbit-data:/var/lib/orbit mvp-orbit
+```
+
+镜像默认设置 `ORBIT_HUB_HOST=0.0.0.0`，并把状态保存在 `/var/lib/orbit`。
+
+## 网络模型
+
+只需要满足：
+
+- 每台 client 可以通过 HTTP 或 HTTPS 访问控制 host
+- host 不需要主动连接 client
+- client 之间不需要直接互通
+
+实时链路使用 `host -> client` 的 SSE，以及 `client -> host` 的 HTTP POST。

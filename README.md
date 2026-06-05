@@ -7,298 +7,232 @@
 </p>
 
 <div align="center">by MVP Lab.</div>
+## What Orbit Is
 
-## Why Orbit
+`mvp-orbit` is an HTTP-only peer command channel.
 
-`mvp-orbit` is a small HTTP-only remote execution loop for one specific workflow:
+One machine runs the control `host`. Each `client` joins a named channel with only:
 
-1. prepare code on one machine
-2. send it to another machine
-3. execute commands there
-4. stream output back immediately
+- a local alias
+- the host URL
+- the channel name
 
-It is especially useful when SSH is unavailable, inconvenient, or too manual for repeated workflows.
-
-Typical use cases:
-
-- AI coding agents that need remote execution
-- GPU / NPU / embedded debug loops
-- build on one machine, run on another
-
-## Roles
-
-Orbit has three decoupled roles:
-
-- `Hub`
-  The control plane. It stores packages, commands, shell sessions, tokens, ownership metadata, and realtime event logs.
-- `Agent`
-  The execution side. An Agent keeps one long-lived SSE control stream to the Hub, executes work locally, and posts events back over HTTP.
-- `User`
-  The control side. A user sends commands to the Hub and targets a specific Agent.
+The first client in a channel is accepted automatically. Later clients create pending join requests, and any already-joined client in that channel can approve or reject them. After approval, members of the same channel can send commands, open shells, and transfer files through the host. Clients do not need direct network access to each other.
 
 ```mermaid
 flowchart LR
-    U["User<br/>control side"]
-    H["Hub<br/>control plane"]
-    A["Agent<br/>execution side"]
+    H["control host\nHTTP + SSE relay"]
+    A["client-a"]
+    B["client-b"]
+    C["client-c"]
 
-    U -->|"orbit connect<br/>package upload<br/>cmd exec<br/>shell start"| H
-    U <-->|"SSE command stream<br/>SSE shell stream"| H
-    A <-->|"SSE control stream<br/>HTTP event POSTs"| H
+    A <-->|"join approval\ncommands / shells / files"| H
+    B <-->|"join approval\ncommands / shells / files"| H
+    C <-->|"join approval\ncommands / shells / files"| H
 ```
 
-This means the Hub can run on a dedicated server. The only required network condition is:
+## Security Model
 
-- the User machine can reach the Hub over HTTP or HTTPS
-- the Agent machine can reach the Hub over HTTP or HTTPS
+Channel membership is the trust boundary.
 
-The User and Agent do not need direct connectivity to each other.
+- The first client creates the channel and receives a member token.
+- Later clients cannot join until an existing member approves the join request.
+- A member token grants access to that channel until it expires.
+- Any approved member can execute commands on any other connected member.
 
-## Ownership And Auth
+This is not a sandbox. Only approve clients and run commands in channels where every member is trusted.
 
-Every Agent belongs to exactly one `user_id`.
+## Commands
 
-- The first successful Agent control-stream connection registers that `agent_id` under the current user.
-- Only the same user can submit commands to that Agent, open shells on it, or read its outputs.
-- Agents owned by different users are isolated and cannot be mixed.
-- Package access is also isolated per user, even when two users upload identical bytes and receive the same `package_id`.
+Public CLI commands are intentionally small:
 
-Orbit uses two token types:
-
-- `bootstrap_token`
-  A Hub-side bootstrap credential used only by `orbit connect`.
-- `user_token`
-  The runtime credential used by both the User-side CLI and the Agent when talking to the Hub API.
-
-In normal operation, all Hub API calls use `user_token`.
-
-The `bootstrap_token` is only used to mint a 7-day `user_token`:
-
-```text
-bootstrap_token -> orbit connect -> user_token -> normal Hub API traffic
+```bash
+orbit host
+orbit join
+orbit join-requests
+orbit approve <REQUEST_ID>
+orbit reject <REQUEST_ID>
+orbit peers
+orbit exec <peer> -- <command>
+orbit sh <peer>
+orbit put <peer> <local> <remote>
+orbit get <peer> <remote> <local>
 ```
 
-Important notes:
-
-- The control machine and the Agent machine do not need to share the exact same token string.
-- They do need tokens that belong to the same `user_id` if that user should control that Agent.
-- `orbit connect` prints an `ORBIT_AGENT_CONFIG_STRING` that can be copied to another machine.
-- `orbit init node` or `orbit init agent` can consume that config-string, but `agent_id` is still chosen locally on the Agent machine.
-
-## Runtime Model
-
-Orbit is built around three user-facing actions:
-
-- `package`
-  Build a deterministic `.tar.gz` from a directory and upload it to the Hub.
-- `cmd exec`
-  Send a command to a specific Agent. `package_id` is optional.
-- `shell`
-  Open a persistent remote shell session with PTY semantics and reconnect support.
-
-Key runtime semantics:
-
-- Hub, CLI, and Agent communicate using HTTP only.
-- Realtime delivery uses `SSE` down and `POST` up.
-- The Agent startup directory is the base workspace unless `workspace_root` is configured.
-- Commands without `package_id` run directly in the base workspace.
-- Commands with `package_id` run in a package-specific subdirectory under the base workspace.
-- Shell sessions start in the base workspace by default, or in the package workspace when `package_id` is provided.
-- `cmd exec` waits and streams output by default. Use `--detach` to return immediately.
-- `cmd exec` and `cmd output --follow` now return a local exit code derived from the remote terminal state and print a one-line summary on `stderr`.
+`exec`, `sh`, and `put/get` are the only peer operation modes.
 
 ## Quick Start
 
-### 1. Start the Hub
-
-On the Hub machine:
+### 1. Start the Host
 
 ```bash
-orbit init hub
-orbit hub serve
+orbit host
 ```
 
-`orbit init hub` writes Hub config and prints the bootstrap token used by `orbit connect`.
+The host stores channel state in SQLite and relays events over HTTP/SSE. By default it binds to `127.0.0.1:8080`; set `ORBIT_HUB_HOST=0.0.0.0` when it must listen on the network.
 
-### 2. Connect as a user
-
-On the user machine:
+### 2. Join the First Client
 
 ```bash
-orbit connect
+orbit join --host http://HOST:8080 --alias client-a --channel team-a
 ```
 
-`orbit connect` asks for:
+`orbit join` is a foreground long-running process. After joining, it starts the client loop and keeps receiving commands, shells, file requests, and join approvals. If the process exits, that client stops receiving work.
 
-- the Hub URL
-- a `user_id`
-- the Hub `bootstrap_token`
+Use `--no-start` only when you want to save config without starting the client loop:
 
-It then writes `user_token` and `expires_at` into local config and prints:
+```bash
+orbit join --host http://HOST:8080 --alias client-a --channel team-a --no-start
+```
+
+### 3. Join More Clients
+
+On another machine:
+
+```bash
+orbit join --host http://HOST:8080 --alias client-b --channel team-a
+```
+
+The new client waits for approval. Any foreground `orbit join` process already in the channel prompts directly:
 
 ```text
-ORBIT_AGENT_CONFIG_STRING=orbit-agent-config-string-v1:...
+[orbit] new client join request
+  alias: client-b
+  channel: channel-...
+  request: join-...
+[orbit] approve this client? [y/N]:
 ```
 
-### 3. Initialize and run the Agent
-
-On the agent machine:
+If no client is running in an interactive terminal, approve manually from any existing member:
 
 ```bash
-orbit init agent --config-string 'orbit-agent-config-string-v1:...' --agent-id agent-a
-orbit agent run
+orbit join-requests
+orbit approve <REQUEST_ID>
 ```
 
-Or use the interactive flow:
+Use `orbit reject <REQUEST_ID>` to deny a request. Use `--no-wait` on the joining client if it should submit the request and exit immediately.
+
+### 4. List Peers
 
 ```bash
-orbit init agent
+orbit peers
 ```
 
-Then paste the config-string and enter the local `agent_id`.
-
-When the Agent connects its control stream successfully, that `agent_id` becomes owned by the current user.
-
-## Common Flows
-
-### Upload a package
+### 5. Run One Command
 
 ```bash
-orbit package upload --source-dir /path/to/project
+orbit exec client-b -- uname -a
 ```
 
-Example response:
-
-```json
-{
-  "package_id": "sha256-...",
-  "size": 12345,
-  "created_at": "2026-03-10T00:00:00+00:00"
-}
-```
-
-### Execute in the Agent base workspace
+Use shell parsing when you need shell operators, variables, pipes, or `cd`:
 
 ```bash
-orbit cmd exec \
-  --agent-id agent-a \
-  -- pwd
+orbit exec client-b --shell "cd /tmp && pwd && ls -la"
 ```
 
-### Execute against an uploaded package
+Commands run inside the target client's workspace. `--working-dir` must stay inside that workspace.
+
+### 6. Open an Interactive Shell
 
 ```bash
-orbit cmd exec \
-  --agent-id agent-a \
-  --package-id <PACKAGE_ID> \
-  -- python3 train.py --epochs 1
+orbit sh client-b
 ```
 
-### Execute a compound shell command
+### 7. Transfer Files
+
+Push a local file to a peer:
 
 ```bash
-orbit cmd exec \
-  --agent-id agent-a \
-  --shell \
-  "cd /cache/models && HF_TOKEN=hf_xxx hf download repo --local-dir model-dir"
+orbit put client-b ./local.txt inbox/local.txt
 ```
 
-Use `--shell` when the remote command needs shell features such as:
-
-- `cd`
-- `&&`
-- pipes
-- redirects
-- inline environment assignments
-
-### Submit without waiting
+Pull a file from a peer:
 
 ```bash
-orbit cmd exec \
-  --agent-id agent-a \
-  --package-id <PACKAGE_ID> \
-  --detach \
-  -- python3 train.py
+orbit get client-b inbox/local.txt ./downloaded.txt
 ```
 
-Then inspect it later:
+The default size limit is `1 MiB`. Raise it explicitly when needed:
 
 ```bash
-orbit cmd status --command-id <COMMAND_ID>
-orbit cmd output --command-id <COMMAND_ID>
-orbit cmd output --command-id <COMMAND_ID> --follow
-orbit cmd cancel --command-id <COMMAND_ID>
+orbit put --max-bytes 10485760 client-b ./model.bin models/model.bin
+orbit get --max-bytes 10485760 client-b models/model.bin ./model.bin
 ```
 
-Notes:
-
-- `orbit cmd exec` streams output and exits with a mapped local exit code unless `--detach` is used.
-- `orbit cmd output --follow` reattaches to a detached command, prints a terminal summary on `stderr`, and exits with a mapped local exit code.
-
-### Open a remote shell
-
-Base workspace:
-
-```bash
-orbit shell start --agent-id agent-a
-```
-
-Package workspace:
-
-```bash
-orbit shell start --agent-id agent-a --package-id <PACKAGE_ID>
-```
-
-Manage sessions:
-
-```bash
-orbit shell list
-orbit shell list --agent-id agent-a
-orbit shell attach --session-id <SESSION_ID>
-orbit shell close --session-id <SESSION_ID>
-```
-
-Notes:
-
-- `orbit shell start` attaches immediately when run in a TTY, unless `--detach` is used.
-- `orbit shell start --detach` prints the new `session_id` without attaching.
-- `orbit shell attach` gives you a PTY-backed remote shell.
-- To close a shell explicitly, use `orbit shell close --session-id <SESSION_ID>` from any terminal with the same user token.
+Relative remote paths are resolved under the target client's workspace. Absolute remote paths are allowed and should be used carefully.
 
 ## Configuration
 
-Default config path:
+The default config file is:
 
 ```text
 ~/.config/mvp-orbit/config.toml
 ```
 
-Current config shape:
+`orbit join` writes the host URL, local client alias, member token, and token expiry. Non-join commands read this file automatically. You can override values with CLI flags such as `--hub-url`, `--member-token`, and `--token-expires-at`.
 
-```toml
-[hub]
-host = "127.0.0.1"
-port = 8080
-db = "./.orbit-hub/hub.sqlite3"
-object_root = "./.orbit-hub/objects"
-url = "http://127.0.0.1:8080"
+Useful runtime environment variables:
 
-[auth]
-bootstrap_token = "..."  # optional on the hub host; used by orbit connect
-user_token = "..."       # used by CLI and Agent runtime
-expires_at = "2026-03-18T12:34:56+00:00"
-
-[agent]
-id = "agent-a"
-workspace_root = "./workspace"
+```bash
+ORBIT_CONFIG=~/.config/mvp-orbit/config.toml
+ORBIT_WORKSPACE_ROOT=/path/to/workspace
+ORBIT_HEARTBEAT_SEC=15
+ORBIT_LOG_LEVEL=INFO      # DEBUG, INFO, WARNING, ERROR
+NO_COLOR=1               # disable ANSI colors
 ```
 
-## Legacy Notes
+Host environment variables:
 
-The following older concepts are no longer part of the product:
+```bash
+ORBIT_HUB_HOST=127.0.0.1
+ORBIT_HUB_PORT=8080
+ORBIT_HUB_DB=./.orbit-hub/hub.sqlite3
+ORBIT_OBJECT_ROOT=./.orbit-hub/objects
+ORBIT_ACCESS_LOG=0        # set to 1 to enable uvicorn HTTP access logs
+```
 
-- agent-side polling loops
-- `commands/next` and `shells/next`
-- shared bundle strings such as `ORBIT_AGENT_INIT`
-- `--shared-config`
-- legacy run/task object workflows
+## Empty Channel Cleanup
+
+The host automatically removes channels that have no online clients. Clients send heartbeat events while `orbit join` is running. A channel is considered empty when no client has been seen within `ORBIT_CLIENT_OFFLINE_SEC`, and it is deleted after `ORBIT_CHANNEL_EMPTY_TTL_SEC` of no activity.
+
+Defaults:
+
+```bash
+ORBIT_CHANNEL_CLEANUP_ENABLED=1
+ORBIT_CLIENT_OFFLINE_SEC=90
+ORBIT_CHANNEL_EMPTY_TTL_SEC=3600
+ORBIT_CHANNEL_CLEANUP_INTERVAL_SEC=60
+```
+
+Deleting a channel removes its approved members, pending join requests, stale client records, tokens, command history, shell history, and file-transfer history for that channel.
+
+## Logging
+
+Runtime logs use a compact structured line format:
+
+```text
+[15:52:34] INFO    client │ client.runtime     │ command.start client_id=client-a argv="python3 -V"
+```
+
+The message part uses `event key=value` so it remains easy to search and parse.
+
+## Docker Host
+
+The Dockerfile runs the host:
+
+```bash
+docker build -t mvp-orbit .
+docker run --rm -p 8080:8080 -v orbit-data:/var/lib/orbit mvp-orbit
+```
+
+The image sets `ORBIT_HUB_HOST=0.0.0.0` and stores state under `/var/lib/orbit`.
+
+## Network Model
+
+Only these connections are required:
+
+- each client can reach the control host over HTTP or HTTPS
+- the host does not need to initiate connections back to clients
+- clients do not need direct connectivity to each other
+
+Realtime delivery uses SSE from host to client and HTTP POST from client to host.
