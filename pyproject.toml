@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mvp-orbit"
-version = "0.5.0"
+version = "0.6.0"
 description = "HTTP peer command channel for clients"
 requires-python = ">=3.11"
 dependencies = [
